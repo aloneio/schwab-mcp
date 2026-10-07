@@ -1,8 +1,9 @@
 # Schwab MCP Server
 
 A Model Context Protocol (MCP) server that enables AI assistants like Claude to
-securely interact with Charles Schwab accounts and market data through the
-official Schwab API.
+securely access Charles Schwab account and market data through the official
+Schwab API. This server is intentionally read-only and does not expose order
+placement, replacement, or cancellation capabilities.
 
 ## What You Can Do
 
@@ -21,7 +22,8 @@ Ask Claude to:
 This is an unofficial, community-developed TypeScript MCP server for Charles
 Schwab. It has not been approved, endorsed, or certified by Charles Schwab. It
 is provided as-is, and its functionality may be incomplete or unstable. Use at
-your own risk, especially when dealing with financial data or transactions.
+your own risk when handling financial data. The MCP surface is intentionally
+read-only and cannot place, replace, or cancel orders.
 
 ## Overview
 
@@ -30,8 +32,8 @@ providing:
 
 - **Secure OAuth Authentication**: Implements Schwab's OAuth 2.0 flow with PKCE
   for secure authentication
-- **Comprehensive Trading Tools**: Access to accounts, orders, quotes, and
-  transactions
+- **Read-Only Brokerage Data**: Access to accounts, order history, quotes, and
+  transactions without order execution
 - **Market Data Tools**: Real-time quotes, price history, market hours, movers,
   and options chains
 - **Account Privacy**: Built-in account identifier scrubbing to protect
@@ -41,18 +43,15 @@ providing:
 
 ## Features
 
-### Trading Tools
+### Account & Brokerage Data Tools
 
 - **Account Management**
   - `getAccounts`: Retrieve all account information with positions and balances
   - `getAccountNumbers`: Get list of account identifiers
-- **Order Management**
+- **Order History (Read-Only)**
   - `getOrder`: Get order by ID
   - `getOrders`: Fetch orders with filtering by status, time range, and symbol
   - `getOrdersByAccountNumber`: Get orders by account number
-  - `cancelOrder`: Cancel an order (Experimental)
-  - `placeOrder`: Place an order (Experimental)
-  - `replaceOrder`: Replace an order (Experimental)
 - **Market Quotes**
   - `getQuotes`: Get real-time quotes for multiple symbols
   - `getQuoteBySymbolId`: Get detailed quote for a single symbol
@@ -61,6 +60,10 @@ providing:
     date filtering
 - **User Preferences**
   - `getUserPreference`: Retrieve user trading preferences and settings
+
+> [!IMPORTANT] This MCP server intentionally exposes no order-write tools. It
+> cannot place, replace, or cancel Schwab orders. Order endpoints in this
+> project are limited to read-only retrieval.
 
 ### Market Data Tools
 

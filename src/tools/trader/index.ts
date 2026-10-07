@@ -6,10 +6,7 @@ import {
 	GetOrdersParams,
 	GetAccountsParams,
 	GetOrdersByAccountParams,
-	PlaceOrderParams,
 	GetOrderByIdParams,
-	CancelOrderParams,
-	ReplaceOrderParams,
 	GetTransactionsParams,
 	GetTransactionByIdParams,
 	GetUserPreferenceParams,
@@ -92,50 +89,12 @@ export const toolSpecs = [
 		},
 	}),
 	createToolSpec({
-		name: 'placeOrder',
-		description: 'Place order for a specific account',
-		schema: PlaceOrderParams,
-		call: async (c, p) => {
-			const order = await c.trader.orders.placeOrderForAccount({
-				pathParams: { accountNumber: p.accountNumber },
-				body: p,
-			})
-			const displayMap = await buildAccountDisplayMap(c)
-			return scrubAccountIdentifiers(order, displayMap)
-		},
-	}),
-	createToolSpec({
 		name: 'getOrder',
 		description: 'Get order by order id for a specific account',
 		schema: GetOrderByIdParams,
 		call: async (c, p) => {
 			const order = await c.trader.orders.getOrderByOrderId({
 				pathParams: { accountNumber: p.accountNumber, orderId: p.orderId },
-			})
-			const displayMap = await buildAccountDisplayMap(c)
-			return scrubAccountIdentifiers(order, displayMap)
-		},
-	}),
-	createToolSpec({
-		name: 'cancelOrder',
-		description: 'Cancel order by order id for a specific account',
-		schema: CancelOrderParams,
-		call: async (c, p) => {
-			const order = await c.trader.orders.cancelOrder({
-				pathParams: { accountNumber: p.accountNumber, orderId: p.orderId },
-			})
-			const displayMap = await buildAccountDisplayMap(c)
-			return scrubAccountIdentifiers(order, displayMap)
-		},
-	}),
-	createToolSpec({
-		name: 'replaceOrder',
-		description: 'Replace order by order id for a specific account',
-		schema: ReplaceOrderParams,
-		call: async (c, p) => {
-			const order = await c.trader.orders.replaceOrder({
-				pathParams: { accountNumber: p.accountNumber, orderId: p.orderId },
-				body: p,
 			})
 			const displayMap = await buildAccountDisplayMap(c)
 			return scrubAccountIdentifiers(order, displayMap)
@@ -187,6 +146,14 @@ export const toolSpecs = [
 			logger.info('[getTransaction] Fetching transaction', {
 				transactionId: p.transactionId,
 			})
+			const transaction = await c.trader.transactions.getTransactionById({
+				pathParams: {
+					accountNumber: p.accountNumber,
+					transactionId: p.transactionId,
+				},
+			})
+			const displayMap = await buildAccountDisplayMap(c)
+			return scrubAccountIdentifiers(transaction, displayMap)
 		},
 	}),
 	createToolSpec({
