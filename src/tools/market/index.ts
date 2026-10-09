@@ -3,7 +3,6 @@ import {
 	GetInstrumentsParams,
 	GetOptionChainParams,
 	GetOptionExpirationChainParams,
-	GetPriceHistoryParams,
 	GetQuoteBySymbolIdParams,
 	GetQuotesParams,
 } from '@sudowealth/schwab-api'
@@ -13,6 +12,7 @@ import {
 	MarketHoursParams,
 	MarketHoursByMarketIdParams,
 	MoversParams,
+	PriceHistoryParams,
 } from './schemas'
 
 export const toolSpecs = [
@@ -123,7 +123,7 @@ export const toolSpecs = [
 	createToolSpec({
 		name: 'getPriceHistory',
 		description: 'Get price history for a specific symbol and date range',
-		schema: GetPriceHistoryParams,
+		schema: PriceHistoryParams,
 		call: (c, p) =>
 			c.marketData.priceHistory.getPriceHistory({
 				queryParams: p,

@@ -1,6 +1,7 @@
 import {
 	GetMarketHoursParams,
 	GetMarketHoursByMarketIdParams,
+	GetPriceHistoryParams,
 	marketData,
 } from '@sudowealth/schwab-api'
 import { z } from 'zod'
@@ -15,6 +16,35 @@ export const calendarDateSchema = z
 			!Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === value
 		)
 	}, 'Date must be a valid calendar date')
+
+function priceHistoryDate(endOfDay = false) {
+	return z
+		.union([z.number().int(), calendarDateSchema, z.null()])
+		.optional()
+		.transform((value) => {
+			if (value === null || value === undefined) return undefined
+			if (typeof value === 'number') return value
+			const date = new Date(value)
+			if (endOfDay) date.setUTCHours(23, 59, 59, 999)
+			return date.getTime()
+		})
+		.describe(
+			endOfDay
+				? 'End date: a valid YYYY-MM-DD includes the entire UTC day (through 23:59:59.999Z); integer epoch milliseconds specify the exact instant. Null or omitted uses the upstream default.'
+				: 'Start date: a valid YYYY-MM-DD starts at 00:00:00.000Z in UTC; integer epoch milliseconds specify the exact instant. Null or omitted uses the upstream default.',
+		)
+}
+
+const priceHistoryDates = {
+	startDate: priceHistoryDate(),
+	endDate: priceHistoryDate(true),
+}
+
+export const PriceHistoryParams =
+	GetPriceHistoryParams.extend(priceHistoryDates)
+
+export const priceHistoryQuerySchema =
+	marketData.priceHistory.GetPriceHistoryQueryParams.extend(priceHistoryDates)
 
 export const MarketHoursParams = GetMarketHoursParams.extend({
 	date: calendarDateSchema.optional(),

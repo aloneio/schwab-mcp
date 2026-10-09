@@ -38,7 +38,16 @@ export async function buildAccountDisplayMap(
 	return displayMap
 }
 
-/** Remove identifiers regardless of whether the SDK represents them as numbers or strings. */
+// Only these free-text fields may contain an account reference in otherwise useful text.
+// Structured business values (CUSIPs, symbols, timestamps, IDs, etc.) must stay intact.
+const ACCOUNT_TEXT_FIELDS = new Set(['description', 'note', 'notes'])
+const ACCOUNT_LABEL_FIELDS = new Set([
+	'nickName',
+	'displayAcctId',
+	'accountDisplay',
+])
+
+/** Remove supported account fields and account references in known free-text fields. */
 export function scrubAccountIdentifiers(
 	data: unknown,
 	displayMap: AccountDisplayMap,
@@ -46,9 +55,21 @@ export function scrubAccountIdentifiers(
 	const identifiers = [...displayMap.keys()]
 		.filter(Boolean)
 		.sort((a, b) => b.length - a.length)
-	function scrub(value: unknown): unknown {
+	const escapedIdentifiers = identifiers
+		.map((id) => id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+		.join('|')
+	const accountIdentifier = identifiers.length
+		? new RegExp(escapedIdentifiers, 'g')
+		: undefined
+	const accountReference = identifiers.length
+		? new RegExp(
+				`(?<![A-Za-z0-9])(?:${escapedIdentifiers})(?![A-Za-z0-9])`,
+				'g',
+			)
+		: undefined
+	function scrub(value: unknown, field?: string): unknown {
 		if (value instanceof Date) return value.toISOString()
-		if (Array.isArray(value)) return value.map(scrub)
+		if (Array.isArray(value)) return value.map((entry) => scrub(entry, field))
 		if (value && typeof value === 'object') {
 			const result: Record<string, unknown> = {}
 			let accountDisplay: string | undefined
@@ -57,7 +78,7 @@ export function scrubAccountIdentifiers(
 					accountDisplay = displayMap.get(String(entry)) ?? 'Account'
 				} else {
 					Object.defineProperty(result, key, {
-						value: scrub(entry),
+						value: scrub(entry, key),
 						enumerable: true,
 						configurable: true,
 						writable: true,
@@ -67,11 +88,14 @@ export function scrubAccountIdentifiers(
 			if (accountDisplay) result.accountDisplay = accountDisplay
 			return result
 		}
-		if (typeof value === 'string') {
-			return identifiers.reduce(
-				(text, id) => text.split(id).join(displayMap.get(id)!),
-				value,
-			)
+		if (typeof value === 'string' && field) {
+			// Account labels may embed a number without spaces, e.g. "IRA11112222".
+			const pattern = ACCOUNT_LABEL_FIELDS.has(field)
+				? accountIdentifier
+				: ACCOUNT_TEXT_FIELDS.has(field)
+					? accountReference
+					: undefined
+			if (pattern) return value.replace(pattern, (id) => displayMap.get(id)!)
 		}
 		return value
 	}

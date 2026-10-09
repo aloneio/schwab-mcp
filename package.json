@@ -1,6 +1,6 @@
 {
   "name": "schwab-mcp",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "type": "module",
   "engines": {
@@ -16,6 +16,7 @@
     "typecheck": "tsc",
     "validate": "npm run typecheck && npm run lint",
     "test": "node --import tsx --test tests/*.test.ts",
+    "test:browser": "node --import tsx --test tests/browser-auth.ts",
     "test:integration": "wrangler deploy --dry-run --config wrangler.example.jsonc --outdir .wrangler/integration && node --import tsx --test tests/worker-integration.ts",
     "build": "wrangler deploy --dry-run --config wrangler.example.jsonc"
   },

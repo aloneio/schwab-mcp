@@ -34,6 +34,11 @@ jobs:
       - name: Test Worker integration
         run: npm run test:integration
 
+      - name: Test browser authorization
+        env:
+          BROWSER_EXECUTABLE: /usr/bin/google-chrome
+        run: npm run test:browser
+
   release:
     name: 🚀 Release
     needs: [validate]

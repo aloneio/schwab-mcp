@@ -151,6 +151,12 @@ void test('complete browser authorization keeps concurrent users of one client s
 			const text = await page.text()
 			const transaction = /name="transaction" value="([^"]+)"/.exec(text)?.[1]
 			assert.ok(transaction)
+			return { cookie, transaction }
+		}
+		async function approve(
+			flow: { cookie: string; transaction: string },
+			cookie = flow.cookie,
+		) {
 			const approval = await SchwabHandler.fetch(
 				new Request('https://server.example/authorize', {
 					method: 'POST',
@@ -159,24 +165,36 @@ void test('complete browser authorization keeps concurrent users of one client s
 						Origin: 'https://server.example',
 						'Content-Type': 'application/x-www-form-urlencoded',
 					},
-					body: new URLSearchParams({ transaction, decision: 'approve' }),
+					body: new URLSearchParams({
+						transaction: flow.transaction,
+						decision: 'approve',
+					}),
 				}),
 				env,
 			)
-			assert.equal(approval.status, 302)
+			assert.equal(approval.status, 200)
+			assert.equal(approval.headers.has('Location'), false)
+			const href = /id="continue" href="([^"]+)"/.exec(
+				await approval.text(),
+			)?.[1]
+			assert.ok(href)
 			assert.equal(
-				new URL(approval.headers.get('Location')!).searchParams.get('state'),
-				transaction,
+				new URL(href.replaceAll('&amp;', '&')).searchParams.get('state'),
+				flow.transaction,
 			)
-			return { cookie, transaction }
 		}
-		const first = await begin()
-		const second = await begin()
+		const [first, second] = await Promise.all([begin(), begin()])
+		const sharedBrowserCookies = `${first.cookie}; ${second.cookie}`
+		assert.notEqual(first.cookie.split('=')[0], second.cookie.split('=')[0])
+		await Promise.all([
+			approve(first, sharedBrowserCookies),
+			approve(second, sharedBrowserCookies),
+		])
 		const callback = (flow: typeof first, code: string) =>
 			SchwabHandler.fetch(
 				new Request(
 					`https://server.example/callback?state=${flow.transaction}&code=${code}`,
-					{ headers: { Cookie: flow.cookie } },
+					{ headers: { Cookie: sharedBrowserCookies } },
 				),
 				env,
 			)
@@ -185,6 +203,14 @@ void test('complete browser authorization keeps concurrent users of one client s
 			callback(second, 'fixture-b'),
 		])
 		assert.ok(responses.every((response) => response.status === 302))
+		for (const [index, response] of responses.entries()) {
+			assert.match(response.headers.get('Set-Cookie')!, /Max-Age=0$/)
+			assert.ok(
+				response.headers
+					.get('Set-Cookie')!
+					.includes([first, second][index]!.transaction),
+			)
+		}
 		assert.deepEqual(completed.map((value) => value.userId).sort(), [
 			'user-a',
 			'user-b',
@@ -226,8 +252,13 @@ void test('complete browser authorization keeps concurrent users of one client s
 			}),
 			env,
 		)
-		assert.equal(denial.status, 302)
-		const denialLocation = new URL(denial.headers.get('Location')!)
+		assert.equal(denial.status, 200)
+		assert.match(denial.headers.get('Set-Cookie')!, /Max-Age=0$/)
+		const denialHref = /id="continue" href="([^"]+)"/.exec(
+			await denial.text(),
+		)?.[1]
+		assert.ok(denialHref)
+		const denialLocation = new URL(denialHref.replaceAll('&amp;', '&'))
 		assert.equal(denialLocation.searchParams.get('error'), 'access_denied')
 		assert.equal(denialLocation.searchParams.get('state'), authRequest.state)
 		assert.equal(denialLocation.searchParams.get('iss'), authRequest.issuer)

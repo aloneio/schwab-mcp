@@ -102,15 +102,32 @@ export interface ToolSpec<S extends z.AnyZodObject> {
 	name: ReadOnlyToolName
 	description: string
 	schema: S
-	call: (client: ReadOnlySchwabClient, params: z.infer<S>) => Promise<unknown>
+	call: (
+		client: ReadOnlySchwabClient,
+		params: z.infer<S>,
+		context?: ToolContext,
+	) => Promise<unknown>
 }
+
+export interface ToolContext {
+	readonly signal: AbortSignal
+}
+
+/** Production creates a client bound to each call's cancellation signal. */
+export type ReadClientSource =
+	| ReadOnlySchwabClient
+	| ((signal: AbortSignal) => ReadOnlySchwabClient)
 
 // Factory function to create properly typed tool specs
 export function createToolSpec<S extends z.AnyZodObject>(spec: {
 	name: ReadOnlyToolName
 	description: string
 	schema: S
-	call: (client: ReadOnlySchwabClient, params: z.infer<S>) => Promise<unknown>
+	call: (
+		client: ReadOnlySchwabClient,
+		params: z.infer<S>,
+		context?: ToolContext,
+	) => Promise<unknown>
 }): ToolSpec<S> {
 	return spec
 }

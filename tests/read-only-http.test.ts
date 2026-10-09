@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { getEventListeners } from 'node:events'
 import { test } from 'node:test'
 import { setImmediate } from 'node:timers/promises'
 import { AuthServiceError } from '../src/auth/service'
@@ -736,7 +737,7 @@ void test('one request deadline bounds stalled authentication, fetch, body, and 
 	}
 })
 
-void test('deadline aborts a pending backoff without waiting for or issuing the retry', async (t) => {
+void test('a retry that cannot fit the deadline preserves the upstream error without issuing another request', async (t) => {
 	t.mock.timers.enable({ apis: ['setTimeout'] })
 	let requests = 0
 	const client = createReadOnlySchwabClient(auth, {
@@ -751,13 +752,305 @@ void test('deadline aborts a pending backoff without waiting for or issuing the 
 	)
 	await setImmediate()
 	assert.equal(requests, 1)
-	assert.equal(result.settled, false)
-	t.mock.timers.tick(20)
-	await setImmediate()
-	assertTimedOut(result)
+	assert.equal(result.settled, true)
+	assert.ok(result.error instanceof SchwabReadError)
+	assert.equal(result.error.status, 503)
+	assert.equal(result.error.code, 'upstream_error')
 	t.mock.timers.tick(2000)
 	await setImmediate()
 	assert.equal(requests, 1)
+})
+
+void test('Retry-After seconds and HTTP dates are honored without early retries', async (t) => {
+	const now = Date.UTC(2026, 9, 9, 12)
+	for (const [name, header, expectedDelay] of [
+		['seconds', '10', 10_000],
+		['HTTP date', new Date(now + 8_000).toUTCString(), 8_000],
+		['past date', new Date(now - 10_000).toUTCString(), 250],
+		['zero', '0', 250],
+		['invalid text', 'later', 250],
+		['invalid negative', '-1', 250],
+		['invalid decimal', '1.5', 250],
+		['missing', undefined, 250],
+	] as const) {
+		await t.test(name, async (t) => {
+			t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now })
+			const calls: number[] = []
+			const client = createReadOnlySchwabClient(auth, {
+				fetch: async () => {
+					calls.push(Date.now())
+					return calls.length === 1
+						? Response.json(
+								{},
+								{
+									status: 429,
+									headers:
+										header === undefined ? {} : { 'Retry-After': header },
+								},
+							)
+						: Response.json(quotes)
+				},
+			})
+			const result = client.marketData.quotes.getQuotes({
+				queryParams: { symbols: ['DEMO'] },
+			})
+			await setImmediate()
+			assert.deepEqual(calls, [now])
+			t.mock.timers.tick(expectedDelay - 1)
+			await setImmediate()
+			assert.deepEqual(
+				calls,
+				[now],
+				'Must not retry before the permitted delay',
+			)
+			t.mock.timers.tick(1)
+			assert.deepEqual(await result, quotes)
+			assert.deepEqual(calls, [now, now + expectedDelay])
+		})
+	}
+})
+
+void test('retry delays use the remaining total deadline and preserve upstream diagnostics', async (t) => {
+	const now = Date.UTC(2026, 9, 9, 12)
+	for (const [name, status, header, initialWait] of [
+		['seconds exceed remaining time', 429, '1', 700],
+		['date exceeds remaining time', 503, new Date(now + 2000).toUTCString(), 0],
+		['delay equals deadline', 503, '1', 500],
+		['overflowing delay', 429, '9'.repeat(310), 0],
+	] as const) {
+		await t.test(name, async (t) => {
+			t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now })
+			let release!: (response: Response) => void
+			let requests = 0
+			const client = createReadOnlySchwabClient(auth, {
+				timeoutMs: 1500,
+				fetch: () => {
+					requests++
+					return new Promise((resolve) => {
+						release = resolve
+					})
+				},
+			})
+			const result = observe(
+				client.marketData.quotes.getQuotes({
+					queryParams: { symbols: ['DEMO'] },
+				}),
+			)
+			await setImmediate()
+			t.mock.timers.tick(initialWait)
+			release(
+				Response.json(
+					{},
+					{
+						status,
+						headers: {
+							'Retry-After': header,
+							'x-request-id': 'fixture-throttled-request',
+						},
+					},
+				),
+			)
+			await setImmediate()
+			assert.equal(result.settled, true)
+			assert.ok(result.error instanceof SchwabReadError)
+			assert.equal(result.error.status, status)
+			assert.equal(result.error.code, 'upstream_error')
+			assert.equal(result.error.getRequestId(), 'fixture-throttled-request')
+			t.mock.timers.tick(30_000)
+			await setImmediate()
+			assert.equal(requests, 1)
+		})
+	}
+})
+
+void test('invalid retry hints retain bounded exponential backoff', async (t) => {
+	const now = Date.UTC(2026, 9, 9, 12)
+	t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now })
+	const calls: number[] = []
+	const client = createReadOnlySchwabClient(auth, {
+		fetch: async () => {
+			calls.push(Date.now())
+			return Response.json(
+				{},
+				{ status: 503, headers: { 'Retry-After': 'invalid' } },
+			)
+		},
+	})
+	const result = observe(
+		client.marketData.quotes.getQuotes({ queryParams: { symbols: ['DEMO'] } }),
+	)
+	await setImmediate()
+	t.mock.timers.tick(250)
+	await setImmediate()
+	t.mock.timers.tick(500)
+	await setImmediate()
+	assert.deepEqual(calls, [now, now + 250, now + 750])
+	assert.equal(result.settled, true)
+	assert.ok(result.error instanceof SchwabReadError)
+	assert.equal(result.error.status, 503)
+	t.mock.timers.tick(30_000)
+	await setImmediate()
+	assert.equal(calls.length, 3)
+})
+
+function assertCancelled(result: ReturnType<typeof observe>) {
+	assert.equal(result.settled, true)
+	assert.ok(result.error instanceof SchwabReadError)
+	assert.equal(result.error.status, 499)
+	assert.equal(result.error.code, 'request_cancelled')
+	assert.ok(!result.error.message.includes('private-reason'))
+}
+
+void test('caller cancellation prevents queued authentication and HTTP work', async (t) => {
+	for (const alreadyCancelled of [true, false]) {
+		await t.test(
+			alreadyCancelled
+				? 'already cancelled'
+				: 'cancelled before scheduled work',
+			async () => {
+				const controller = new AbortController()
+				let calls = 0
+				if (alreadyCancelled) controller.abort('private-reason')
+				const client = createReadOnlySchwabClient(
+					{
+						...auth,
+						getAccessToken: async () => {
+							calls++
+							return 'fixture-token'
+						},
+					},
+					{
+						signal: controller.signal,
+						fetch: async () => {
+							calls++
+							return Response.json(quotes)
+						},
+					},
+				)
+				const result = observe(
+					client.marketData.quotes.getQuotes({
+						queryParams: { symbols: ['DEMO'] },
+					}),
+				)
+				controller.abort('private-reason')
+				await setImmediate()
+				assertCancelled(result)
+				assert.equal(calls, 0)
+				assert.equal(getEventListeners(controller.signal, 'abort').length, 0)
+			},
+		)
+	}
+})
+
+void test('caller cancellation releases pending reads without aborting shared authentication', async (t) => {
+	for (const stage of ['token', 'refresh', 'fetch', 'body'] as const) {
+		await t.test(stage, async () => {
+			const controller = new AbortController()
+			let release!: () => void
+			const pending = new Promise<void>((resolve) => {
+				release = resolve
+			})
+			let tokenReads = 0
+			let refreshes = 0
+			let refreshCompleted = false
+			let requests = 0
+			let requestSignal: AbortSignal | undefined
+			const client = createReadOnlySchwabClient(
+				{
+					getAccessToken: async () => {
+						tokenReads++
+						if (stage === 'token') await pending
+						return 'fixture-token'
+					},
+					refreshIfNeeded: async () => {
+						refreshes++
+						await pending
+						refreshCompleted = true
+						return { accessToken: 'fixture-new-token' }
+					},
+					invalidateIfCurrent: auth.invalidateIfCurrent,
+				},
+				{
+					signal: controller.signal,
+					fetch: async (input, init) => {
+						requests++
+						requestSignal = new Request(input, init).signal
+						if (stage === 'fetch') await pending
+						if (stage === 'refresh') return Response.json({}, { status: 401 })
+						const response = Response.json(quotes)
+						if (stage === 'body')
+							response.json = async () => {
+								await pending
+								return quotes
+							}
+						return response
+					},
+				},
+			)
+			const result = observe(
+				client.marketData.quotes.getQuotes({
+					queryParams: { symbols: ['DEMO'] },
+				}),
+			)
+			await setImmediate()
+			assert.equal(result.settled, false)
+			controller.abort('private-reason')
+			await setImmediate()
+			assertCancelled(result)
+			assert.equal(getEventListeners(controller.signal, 'abort').length, 0)
+			if (requestSignal) assert.equal(requestSignal.aborted, true)
+			release()
+			await setImmediate()
+			assert.equal(tokenReads, 1)
+			assert.equal(requests, stage === 'token' ? 0 : 1)
+			assert.equal(refreshes, stage === 'refresh' ? 1 : 0)
+			assert.equal(refreshCompleted, stage === 'refresh')
+		})
+	}
+})
+
+void test('cancellation during Retry-After removes the waiter and never issues the retry', async (t) => {
+	t.mock.timers.enable({ apis: ['setTimeout', 'Date'] })
+	const controller = new AbortController()
+	let requests = 0
+	const client = createReadOnlySchwabClient(auth, {
+		signal: controller.signal,
+		fetch: async () => {
+			requests++
+			return Response.json(
+				{},
+				{ status: 429, headers: { 'Retry-After': '10' } },
+			)
+		},
+	})
+	const result = observe(
+		client.marketData.quotes.getQuotes({ queryParams: { symbols: ['DEMO'] } }),
+	)
+	await setImmediate()
+	assert.equal(result.settled, false)
+	t.mock.timers.tick(1000)
+	controller.abort()
+	await setImmediate()
+	assertCancelled(result)
+	t.mock.timers.tick(30_000)
+	await setImmediate()
+	assert.equal(requests, 1)
+	assert.equal(getEventListeners(controller.signal, 'abort').length, 0)
+})
+
+void test('successful reads remove their caller cancellation listener', async () => {
+	const controller = new AbortController()
+	const client = createReadOnlySchwabClient(auth, {
+		signal: controller.signal,
+		fetch: async () => Response.json(quotes),
+	})
+	assert.deepEqual(
+		await client.marketData.quotes.getQuotes({
+			queryParams: { symbols: ['DEMO'] },
+		}),
+		quotes,
+	)
+	assert.equal(getEventListeners(controller.signal, 'abort').length, 0)
 })
 
 void test('safe authentication-service errors preserve status, code, message, and request ID', async (t) => {

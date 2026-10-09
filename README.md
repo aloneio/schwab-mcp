@@ -93,6 +93,18 @@ protect its credentials and use the intended app configuration.
   - `getOptionChain`: Retrieve full options chain data with Greeks
   - `getOptionExpirationChain`: Get option expiration dates
 
+Date-only ranges use UTC: a valid `YYYY-MM-DD` start is midnight, and an end
+includes the entire day through `23:59:59.999Z`. Invalid calendar dates are
+rejected. Order and transaction tools also accept ISO timestamps with a timezone
+and preserve their exact instant. Price history accepts integer epoch
+milliseconds unchanged; omitted or null bounds retain Schwab's defaults.
+
+Cancelling a tool call or closing its MCP session aborts its active HTTP reads
+and prevents subsequent reads for that call. Other calls and shared credential
+refreshes continue independently. Transient retries honor `Retry-After` seconds
+and HTTP dates; if the delay cannot fit within the read deadline, the upstream
+error is returned without retrying early.
+
 ## Prerequisites
 
 1. **Schwab Developer Account**: Register at
@@ -295,15 +307,20 @@ Schwab.
    in a Durable Object. Transactions expire after 10 minutes and callbacks
    consume them once.
 2. **Browser binding**: HMAC-SHA256 authenticates a random browser cookie with
-   `Secure`, `HttpOnly`, `SameSite=Lax`, and a `__Host-` name. Explicit approval
-   is required before continuing to Schwab.
+   `Secure`, `HttpOnly`, `SameSite=Lax`, and a `__Host-` name. Each
+   authorization transaction has its own expiring cookie so concurrent tabs
+   remain independent. Explicit approval is required; a confirmation page then
+   provides a link to continue to Schwab. Cancelled connections return to the
+   client through a link.
 3. **Credential isolation**: Per-user Durable Objects store Schwab tokens and
    serialize refresh operations. MCP sessions retain identity, not token copies.
 4. **Read-only business transport**: A URL and method allowlist limits brokerage
    and market-data calls to supported `GET` endpoints.
 5. **Account scrubbing**: Account display labels replace supported account
-   identifier fields in tool results. Clients still receive the financial data
-   they request; this is not anonymization of the entire response.
+   identifier fields and references in known account labels and free-text
+   fields. Structured values such as CUSIPs and symbols stay intact even when
+   they contain the same digits. Clients still receive the financial data they
+   request; this is not anonymization of the entire response.
 6. **Log redaction**: Structured secret and account fields are scrubbed
    recursively before logging, including arrays and nested errors. Avoid putting
    credentials or full response bodies in free-text log messages.
@@ -318,8 +335,8 @@ npm run deploy       # Deploy to Cloudflare Workers
 npm run typecheck    # Run TypeScript type checking
 npm run lint         # Check ESLint rules
 npm test             # Run local regression tests
-npm run test:integration # Build and exercise the local Worker with a fixture upstream
 npm run test:integration # Bundle and run mock OAuth/SSE in a real local Worker
+npm run test:browser  # Exercise consent in an installed Chrome, Edge or Chromium
 npm run build        # Bundle with Wrangler without uploading
 npm run format       # Format code with Prettier
 npm run validate     # Run typecheck and lint together
@@ -360,11 +377,15 @@ dry-run verifies that the Worker bundles. `npm run test:integration` also runs
 the bundled Worker in Miniflare with real local KV and SQLite Durable Objects,
 using an outbound fixture for every Schwab call. It checks OAuth discovery,
 registration, consent, PKCE, token issuance, SSE initialization, tool discovery,
-status, a quote request, and reauthorization after credential invalidation. CI
-runs both test suites. None of these checks proves that real Schwab
-authorization, token refresh, permissions, or live account/market responses
-work. A credentialed end-to-end check is a separate step and must use the
-intended account and deployment. Dependency audit counts describe installed
+status, a quote request, and reauthorization after credential invalidation.
+`npm run test:browser` launches an isolated Chromium profile and submits the
+actual authorization pages to check browser cookie, Origin, CSP, approval and
+denial behavior. External navigation is intercepted with local fixture
+responses. Set `BROWSER_EXECUTABLE` to the browser binary if it is not in a
+standard location. CI runs all three suites. None of these checks proves that
+real Schwab authorization, token refresh, permissions, or live account/market
+responses work. A credentialed end-to-end check is a separate step and must use
+the intended account and deployment. Dependency audit counts describe installed
 packages; assess the deployed bundle and feature usage before treating each
 advisory as a reachable production issue.
 

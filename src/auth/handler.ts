@@ -9,7 +9,8 @@ import { type Env } from '../../types/env'
 import { getConfig } from '../config'
 import { callAuthCoordinator } from './client'
 import {
-	ensureBrowserBinding,
+	clearBrowserBinding,
+	createBrowserBinding,
 	requireBrowserBinding,
 	requireSameOrigin,
 } from './cookies'
@@ -20,7 +21,7 @@ import {
 	oauthRequestSchema,
 	type TransactionResult,
 } from './service'
-import { renderApprovalDialog } from './ui/approvalDialog'
+import { renderApprovalDialog, renderContinuePage } from './ui/approvalDialog'
 
 const app = new Hono<{ Bindings: Env & { OAUTH_PROVIDER: OAuthHelpers } }>()
 const transactionIdSchema = z.string().uuid()
@@ -82,8 +83,8 @@ app.get('/authorize', async (c) => {
 			'This server requires authorization code flow, PKCE S256, and read scope.',
 		)
 	const transactionId = crypto.randomUUID()
-	const browser = await ensureBrowserBinding(
-		c.req.raw,
+	const browser = await createBrowserBinding(
+		transactionId,
 		config.COOKIE_ENCRYPTION_KEY,
 	)
 	await callAuthCoordinator(
@@ -107,10 +108,6 @@ app.get('/authorize', async (c) => {
 app.post('/authorize', async (c) => {
 	const config = getConfig(c.env)
 	requireSameOrigin(c.req.raw)
-	const browserBinding = await requireBrowserBinding(
-		c.req.raw,
-		config.COOKIE_ENCRYPTION_KEY,
-	)
 	const form = await c.req.formData().catch(() => {
 		throw new AuthServiceError(
 			400,
@@ -126,6 +123,11 @@ app.post('/authorize', async (c) => {
 			'invalid_approval',
 			'Choose whether to approve this connection.',
 		)
+	const browserBinding = await requireBrowserBinding(
+		c.req.raw,
+		transaction.data,
+		config.COOKIE_ENCRYPTION_KEY,
+	)
 	if (decision === 'deny') {
 		const result = await callAuthCoordinator<TransactionResult>(
 			config,
@@ -133,7 +135,11 @@ app.post('/authorize', async (c) => {
 			'/transaction/cancel',
 			{ browserBinding },
 		)
-		return deniedRedirect(result.request)
+		return renderContinuePage({
+			url: deniedRedirectUrl(result.request),
+			approved: false,
+			cookie: clearBrowserBinding(transaction.data),
+		})
 	}
 	const result = await callAuthCoordinator<{ url: string }>(
 		config,
@@ -141,17 +147,18 @@ app.post('/authorize', async (c) => {
 		'/transaction/approve',
 		{ browserBinding },
 	)
-	return Response.redirect(result.url, 302)
+	// A form POST must finish on this origin: Chromium applies form-action to redirects.
+	return renderContinuePage({ url: result.url, approved: true })
 })
 
-function deniedRedirect(request: AuthRequest): Response {
+function deniedRedirectUrl(request: AuthRequest): string {
 	const url = new URL(request.redirectUri)
 	for (const key of ['error', 'error_description', 'error_uri', 'state', 'iss'])
 		url.searchParams.delete(key)
 	url.searchParams.set('error', 'access_denied')
 	if (request.state) url.searchParams.set('state', request.state)
 	if (request.issuer) url.searchParams.set('iss', request.issuer)
-	return Response.redirect(url.toString(), 302)
+	return url.toString()
 }
 
 app.get('/callback', async (c) => {
@@ -165,6 +172,7 @@ app.get('/callback', async (c) => {
 		)
 	const browserBinding = await requireBrowserBinding(
 		c.req.raw,
+		state.data,
 		config.COOKIE_ENCRYPTION_KEY,
 	)
 	const upstreamDenied = !!c.req.query('error')
@@ -182,7 +190,9 @@ app.get('/callback', async (c) => {
 		'/transaction/consume',
 		{ browserBinding },
 	)
-	if (upstreamDenied) return deniedRedirect(transaction.request)
+	c.header('Set-Cookie', clearBrowserBinding(state.data))
+	if (upstreamDenied)
+		return c.redirect(deniedRedirectUrl(transaction.request), 302)
 	const tokens = await exchangeSchwabCode(config, code!, transaction.verifier)
 	const userId = await lookupSchwabUser(tokens.accessToken)
 	await callAuthCoordinator(config, `user:${userId}`, '/tokens/save', tokens)
@@ -193,7 +203,7 @@ app.get('/callback', async (c) => {
 		scope: ['read'],
 		props: { schwabUserId: userId, clientId: transaction.request.clientId },
 	})
-	return Response.redirect(redirectTo, 302)
+	return c.redirect(redirectTo, 302)
 })
 
 export { app as SchwabHandler }

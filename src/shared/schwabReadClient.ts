@@ -1,7 +1,11 @@
 import { marketData, trader, type TokenData } from '@sudowealth/schwab-api'
 import { type z } from 'zod'
 import { AuthServiceError } from '../auth/service'
-import { calendarDateSchema, moversQuerySchema } from '../tools/market/schemas'
+import {
+	calendarDateSchema,
+	moversQuerySchema,
+	priceHistoryQuerySchema,
+} from '../tools/market/schemas'
 import { type ReadOnlySchwabClient, type WireData } from '../tools/types'
 
 const SCHWAB_ORIGIN = 'https://api.schwabapi.com'
@@ -68,6 +72,7 @@ export function createReadOnlyFetch(
 ) {
 	return async (request: Request): Promise<Response> => {
 		assertReadOnlyRequest(request)
+		request.signal.throwIfAborted()
 		const headers = new Headers({ Accept: 'application/json' })
 		const authorization = request.headers.get('Authorization')
 		if (authorization) headers.set('Authorization', authorization)
@@ -103,6 +108,8 @@ type ReadOptions = { pathParams?: unknown; queryParams?: unknown }
 interface ReaderOptions {
 	fetch?: typeof fetch
 	timeoutMs?: number
+	/** Cancels only this caller's reads, never a shared authentication refresh. */
+	signal?: AbortSignal
 }
 
 function withDeadline<T>(
@@ -119,7 +126,11 @@ function withDeadline<T>(
 		}
 		signal.addEventListener('abort', abort, { once: true })
 		void Promise.resolve()
-			.then(operation)
+			.then(() => {
+				// Cancellation can occur after scheduling but before this operation starts.
+				signal.throwIfAborted()
+				return operation()
+			})
 			.then(
 				(value) => {
 					signal.removeEventListener('abort', abort)
@@ -149,6 +160,17 @@ function waitForRetry(ms: number, signal: AbortSignal): Promise<void> {
 		}, ms)
 		signal.addEventListener('abort', abort, { once: true })
 	})
+}
+
+function retryAfterMs(value: string | null, now: number): number | undefined {
+	if (!value) return undefined
+	const text = value.trim()
+	if (/^\d+$/.test(text)) return Number(text) * 1000
+	// Do not let Date.parse interpret invalid numeric delays as calendar dates.
+	if (!/^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*(?:,|\s)/i.test(text))
+		return undefined
+	const date = Date.parse(text)
+	return Number.isNaN(date) ? undefined : Math.max(0, date - now)
 }
 
 function validEnvelope(path: string, data: unknown): boolean {
@@ -219,9 +241,29 @@ export function createReadOnlySchwabClient(
 			}
 			assertReadOnlyRequest(new Request(url))
 			const controller = new AbortController()
+			const cancel = () => {
+				controller.abort(
+					new SchwabReadError(
+						'Schwab read request was cancelled.',
+						499,
+						'request_cancelled',
+					),
+				)
+			}
+			if (options.signal?.aborted) cancel()
+			else options.signal?.addEventListener('abort', cancel, { once: true })
+			const timeoutMs = options.timeoutMs ?? 30_000
+			const deadline = Date.now() + timeoutMs
 			const timeout = setTimeout(
-				() => controller.abort(),
-				options.timeoutMs ?? 30_000,
+				() =>
+					controller.abort(
+						new SchwabReadError(
+							'Schwab read request timed out.',
+							504,
+							'upstream_timeout',
+						),
+					),
+				timeoutMs,
 			)
 			try {
 				let accessToken = await withDeadline(
@@ -269,20 +311,21 @@ export function createReadOnlySchwabClient(
 						(response.status === 429 || response.status >= 500) &&
 						retries < 2
 					) {
-						const retryAfter = Number(response.headers.get('Retry-After'))
-						const delay = Math.min(
-							2000,
-							Math.max(
-								250 * 2 ** retries,
-								Number.isFinite(retryAfter) ? retryAfter * 1000 : 0,
-							),
+						const now = Date.now()
+						const delay = Math.max(
+							250 * 2 ** retries,
+							retryAfterMs(response.headers.get('Retry-After'), now) ?? 0,
 						)
-						await withDeadline(async () => {
-							await response.body?.cancel()
-						}, controller.signal)
-						retries++
-						await waitForRetry(delay, controller.signal)
-						continue
+						// If another attempt cannot fit, return this upstream error instead
+						// of retrying earlier than the server allows or hiding it as a timeout.
+						if (delay < deadline - now) {
+							await withDeadline(async () => {
+								await response.body?.cancel()
+							}, controller.signal)
+							retries++
+							await waitForRetry(delay, controller.signal)
+							continue
+						}
 					}
 					const requestId =
 						response.headers.get('schwab-client-correl-id') ??
@@ -335,12 +378,7 @@ export function createReadOnlySchwabClient(
 				}
 			} catch (error) {
 				if (error instanceof SchwabReadError) throw error
-				if (controller.signal.aborted)
-					throw new SchwabReadError(
-						'Schwab read request timed out.',
-						504,
-						'upstream_timeout',
-					)
+				if (controller.signal.aborted) throw controller.signal.reason
 				if (error instanceof AuthServiceError)
 					throw new SchwabReadError(
 						error.message,
@@ -355,6 +393,7 @@ export function createReadOnlySchwabClient(
 				)
 			} finally {
 				clearTimeout(timeout)
+				options.signal?.removeEventListener('abort', cancel)
 			}
 		}
 	}
@@ -445,7 +484,10 @@ export function createReadOnlySchwabClient(
 				),
 			}),
 			priceHistory: Object.freeze({
-				getPriceHistory: endpoint(marketData.priceHistory.getPriceHistoryMeta),
+				getPriceHistory: endpoint({
+					...marketData.priceHistory.getPriceHistoryMeta,
+					querySchema: priceHistoryQuerySchema,
+				}),
 			}),
 		}),
 	})

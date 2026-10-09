@@ -16,7 +16,10 @@ import {
 	type ReadOnlySchwabClient,
 	type ToolSpec,
 } from '../src/tools'
-import { calendarDateSchema } from '../src/tools/market/schemas'
+import {
+	calendarDateSchema,
+	priceHistoryQuerySchema,
+} from '../src/tools/market/schemas'
 
 const accounts = [
 	{ accountNumber: '11112222', hashValue: 'demo-account-a' },
@@ -323,7 +326,7 @@ const cases: Array<{
 				frequencyType: 'minute',
 				frequency: 5,
 				startDate: Date.parse('2026-09-01'),
-				endDate: Date.parse('2026-10-01'),
+				endDate: Date.parse('2026-10-01T23:59:59.999Z'),
 				needExtendedHoursData: false,
 				needPreviousClose: true,
 			},
@@ -483,7 +486,114 @@ void test('calendar validation rejects invalid dates before invoking any endpoin
 	assert.equal(fixture.calls.length, 0)
 })
 
-void test('MCP market hours and movers reach the HTTP boundary with valid wire parameters', async (t) => {
+void test('price history rejects impossible calendar dates and preserves valid dates, epoch instants, and optional inputs', async (t) => {
+	const fixture = fixtureClient()
+	const session = await connectTools(fixture.client)
+	t.after(session.close)
+	for (const field of ['startDate', 'endDate']) {
+		for (const value of ['2026-02-31', '2026-02-29', '2026-13-01']) {
+			fixture.calls.length = 0
+			const result = await session.mcp.callTool({
+				name: 'getPriceHistory',
+				arguments: { symbol: 'DEMO', [field]: value },
+			})
+			assert.equal(result.isError, true, `${field}: ${value}`)
+			assert.equal(fixture.calls.length, 0)
+			assert.equal(
+				priceHistoryQuerySchema.safeParse({ symbol: 'DEMO', [field]: value })
+					.success,
+				false,
+			)
+		}
+	}
+	const queryCases = [
+		{
+			input: { startDate: '2028-02-29', endDate: '2028-02-29' },
+			expected: {
+				startDate: Date.parse('2028-02-29T00:00:00.000Z'),
+				endDate: Date.parse('2028-02-29T23:59:59.999Z'),
+			},
+		},
+		{
+			input: { startDate: 0, endDate: 1772496000123 },
+			expected: { startDate: 0, endDate: 1772496000123 },
+		},
+		{
+			input: { startDate: null, endDate: null },
+			expected: { startDate: undefined, endDate: undefined },
+		},
+		{ input: {}, expected: { startDate: undefined, endDate: undefined } },
+	]
+	for (const { input, expected } of queryCases) {
+		fixture.calls.length = 0
+		const result = await session.mcp.callTool({
+			name: 'getPriceHistory',
+			arguments: { symbol: 'DEMO', ...input },
+		})
+		assert.notEqual(result.isError, true, JSON.stringify(result))
+		const query = fixture.calls.find(
+			(call) => call.endpoint === 'getPriceHistory',
+		)!.args.queryParams
+		assert.equal(query.startDate, expected.startDate)
+		assert.equal(query.endDate, expected.endDate)
+		assert.equal(query.frequency, 1)
+		const adapterQuery = priceHistoryQuerySchema.parse({
+			symbol: 'DEMO',
+			...input,
+		})
+		assert.equal(adapterQuery.startDate, expected.startDate)
+		assert.equal(adapterQuery.endDate, expected.endDate)
+	}
+})
+
+void test('order and transaction date-only bounds include the complete UTC day while timestamps preserve the exact instant', async (t) => {
+	const fixture = fixtureClient()
+	const session = await connectTools(fixture.client)
+	t.after(session.close)
+	const tools = [
+		['getOrders', {}, 'fromEnteredTime', 'toEnteredTime'],
+		[
+			'getOrdersByAccountNumber',
+			{ accountNumber: 'demo-account-a' },
+			'fromEnteredTime',
+			'toEnteredTime',
+		],
+		['getTransactions', { types: 'TRADE' }, 'startDate', 'endDate'],
+	] as const
+	for (const [name, args, start, end] of tools) {
+		for (const { value, expectedStart, expectedEnd } of [
+			{
+				value: '2028-02-29',
+				expectedStart: '2028-02-29T00:00:00.000Z',
+				expectedEnd: '2028-02-29T23:59:59.999Z',
+			},
+			{
+				value: '2026-10-08T12:34:56.789+08:00',
+				expectedStart: '2026-10-08T04:34:56.789Z',
+				expectedEnd: '2026-10-08T04:34:56.789Z',
+			},
+		]) {
+			fixture.calls.length = 0
+			const result = await session.mcp.callTool({
+				name,
+				arguments: { ...args, [start]: value, [end]: value },
+			})
+			assert.notEqual(result.isError, true, JSON.stringify(result))
+			const query = fixture.calls.find((call) => call.endpoint === name)!.args
+				.queryParams
+			assert.equal(query[start], expectedStart)
+			assert.equal(query[end], expectedEnd)
+		}
+	}
+	const listed = await session.mcp.listTools()
+	for (const [name, , start, end] of tools) {
+		const schema = listed.tools.find((tool) => tool.name === name)!.inputSchema
+		assert.match(JSON.stringify(schema.properties?.[start]), /UTC/)
+		assert.match(JSON.stringify(schema.properties?.[end]), /entire UTC day/)
+	}
+})
+
+void test('MCP market calendars, movers, and price history reach the HTTP boundary with valid wire parameters', async (t) => {
 	const requests: Request[] = []
 	const client = createReadOnlySchwabClient(
 		{
@@ -499,6 +609,9 @@ void test('MCP market hours and movers reach the HTTP boundary with valid wire p
 			fetch: async (input, init) => {
 				const request = new Request(input, init)
 				requests.push(request)
+				if (new URL(request.url).pathname.endsWith('/pricehistory')) {
+					return Response.json({ symbol: 'DEMO', candles: [], empty: true })
+				}
 				return Response.json(
 					new URL(request.url).pathname.includes('/movers/')
 						? { screeners: [] }
@@ -521,11 +634,15 @@ void test('MCP market hours and movers reach the HTTP boundary with valid wire p
 		['getMarketHours', { markets: ['equity', 'option'], date: '2026-10-09' }],
 		['getMarketHoursByMarketId', { market_id: 'equity', date: '2026-10-09' }],
 		['getMovers', { symbol_id: '$SPX', sort: 'VOLUME', frequency: 0 }],
+		[
+			'getPriceHistory',
+			{ symbol: 'DEMO', startDate: '2028-02-29', endDate: '2028-02-29' },
+		],
 	] as const) {
 		const result = await session.mcp.callTool({ name, arguments: args })
 		assert.notEqual(result.isError, true, JSON.stringify(result))
 	}
-	assert.equal(requests.length, 3)
+	assert.equal(requests.length, 4)
 	for (const request of requests) {
 		assert.equal(request.method, 'GET')
 		assert.equal(request.redirect, 'manual')
@@ -536,6 +653,14 @@ void test('MCP market hours and movers reach the HTTP boundary with valid wire p
 	assert.equal(new URL(requests[0]!.url).searchParams.get('date'), '2026-10-09')
 	assert.equal(new URL(requests[1]!.url).searchParams.get('date'), '2026-10-09')
 	assert.equal(new URL(requests[2]!.url).searchParams.get('sort'), 'VOLUME')
+	assert.equal(
+		new URL(requests[3]!.url).searchParams.get('startDate'),
+		String(Date.parse('2028-02-29T00:00:00.000Z')),
+	)
+	assert.equal(
+		new URL(requests[3]!.url).searchParams.get('endDate'),
+		String(Date.parse('2028-02-29T23:59:59.999Z')),
+	)
 })
 
 void test('privacy handles numeric and string IDs, unknown IDs, nested records, and Date values', () => {
@@ -578,6 +703,46 @@ void test('account display fallbacks remain safe when preferences are missing or
 	map = await buildAccountDisplayMap(fixture.client, accounts)
 	assert.equal(map.get('11112222'), 'Account 1')
 	assert.equal(map.get('33334444'), 'Account 2')
+})
+
+void test('account scrubbing preserves colliding business identifiers and redacts account references only in known text fields', () => {
+	const displayMap = new Map([
+		['03783310', 'Retirement'],
+		['11112222', 'Brokerage'],
+		['hash.+[a]', 'Retirement'],
+	])
+	const original = {
+		accountNumber: '03783310',
+		instrument: {
+			symbol: '11112222',
+			cusip: '037833100',
+			description: 'CUSIP 037833100; account 03783310',
+		},
+		orderReference: '11112222',
+		amount: '11112222.00',
+		note: 'Account 03783310, linked hash.+[a], other 11112222.',
+		notes: ['Account #11112222'],
+		nickName: 'IRA03783310',
+		displayAcctId: '03783310',
+		nested: [{ accountNumber: 11112222 }, { hashValue: 'hash.+[a]' }],
+	}
+	assert.deepEqual(scrubAccountIdentifiers(original, displayMap), {
+		accountDisplay: 'Retirement',
+		instrument: {
+			symbol: '11112222',
+			cusip: '037833100',
+			description: 'CUSIP 037833100; account Retirement',
+		},
+		orderReference: '11112222',
+		amount: '11112222.00',
+		note: 'Account Retirement, linked Retirement, other Brokerage.',
+		notes: ['Account #Brokerage'],
+		nickName: 'IRARetirement',
+		displayAcctId: 'Retirement',
+		nested: [{ accountDisplay: 'Brokerage' }, { accountDisplay: 'Retirement' }],
+	})
+	assert.equal(original.instrument.cusip, '037833100')
+	assert.equal(original.accountNumber, '03783310')
 })
 
 void test('MCP brokerage results preserve timestamps, hide raw IDs, and retain preferences without streaming', async (t) => {

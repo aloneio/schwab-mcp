@@ -112,7 +112,7 @@ export const toolSpecs = [
 		description:
 			'Get transactions of the requested type. Omit accountNumber to read all linked accounts; provide an account hash to read only that account.',
 		schema: TransactionsParams,
-		call: async (c, p) => {
+		call: async (c, p, context) => {
 			logger.info('[getTransactions] Fetching accounts')
 			const accounts = p.accountNumber
 				? [{ hashValue: p.accountNumber }]
@@ -127,6 +127,7 @@ export const toolSpecs = [
 			})
 			const transactions: unknown[] = []
 			for (const account of accounts) {
+				context?.signal.throwIfAborted()
 				const accountTransactions = await c.trader.transactions.getTransactions(
 					{
 						pathParams: { accountNumber: account.hashValue },
@@ -143,6 +144,7 @@ export const toolSpecs = [
 				})
 				transactions.push(...accountTransactions)
 			}
+			context?.signal.throwIfAborted()
 			const displayMap = await buildAccountDisplayMap(c)
 			return scrubAccountIdentifiers(transactions, displayMap)
 		},

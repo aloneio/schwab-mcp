@@ -10,6 +10,39 @@ export function escapeHtml(value: string): string {
 	)
 }
 
+/** A real page ends the form submission before the user navigates to another origin. */
+export function renderContinuePage(options: {
+	url: string
+	approved: boolean
+	cookie?: string
+}): Response {
+	const title = options.approved ? 'Continue to Schwab' : 'Connection cancelled'
+	const description = options.approved
+		? 'Your approval was recorded. Continue to Schwab to sign in and finish connecting.'
+		: 'No connection was created. Return to your MCP client to finish cancelling.'
+	const label = options.approved
+		? 'Continue to Schwab sign-in'
+		: 'Return to your MCP client'
+	return new Response(
+		`<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${title}</title></head><body><main><h1>${title}</h1><p>${description}</p>
+<p><a id="continue" href="${escapeHtml(options.url)}" rel="noreferrer">${label}</a></p>
+</main></body></html>`,
+		{
+			headers: {
+				'Content-Type': 'text/html; charset=utf-8',
+				'Cache-Control': 'no-store',
+				'Referrer-Policy': 'no-referrer',
+				'X-Content-Type-Options': 'nosniff',
+				'Content-Security-Policy':
+					"default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+				...(options.cookie ? { 'Set-Cookie': options.cookie } : {}),
+			},
+		},
+	)
+}
+
 export function renderApprovalDialog(options: {
 	clientName: string
 	redirectUri: string
@@ -41,7 +74,8 @@ button{padding:.8rem 1rem;border:1px solid #a6b8cb;border-radius:.4rem;font:inhe
 			'Content-Type': 'text/html; charset=utf-8',
 			'Set-Cookie': options.cookie,
 			'Cache-Control': 'no-store',
-			'Referrer-Policy': 'no-referrer',
+			// no-referrer makes Chromium send Origin: null on this form POST.
+			'Referrer-Policy': 'same-origin',
 			'X-Content-Type-Options': 'nosniff',
 			'Content-Security-Policy': `default-src 'none'; style-src 'nonce-${nonce}'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'`,
 		},

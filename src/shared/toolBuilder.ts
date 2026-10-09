@@ -1,12 +1,17 @@
 import { type McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { type CallToolResult } from '@modelcontextprotocol/sdk/types.js'
 import { type z } from 'zod'
-import { type ReadOnlySchwabClient } from '../tools/types'
+import {
+	type ReadOnlySchwabClient,
+	type ReadClientSource,
+	type ToolContext,
+} from '../tools/types'
 import { logger } from './log'
 
 type ToolHandler<S extends z.AnyZodObject> = (
 	input: z.infer<S>,
 	client: ReadOnlySchwabClient,
+	context: ToolContext,
 ) => Promise<ToolResponse>
 
 type ToolResponse<T = unknown> =
@@ -142,7 +147,7 @@ export function toolSuccess<T>({
 }
 
 export function createTool<S extends z.AnyZodObject>(
-	client: ReadOnlySchwabClient,
+	client: ReadClientSource,
 	server: McpServer,
 	{
 		name,
@@ -167,13 +172,24 @@ export function createTool<S extends z.AnyZodObject>(
 				idempotentHint: true,
 			},
 		},
-		async (args: z.infer<S>) => {
+		async (args: z.infer<S>, extra: ToolContext): Promise<CallToolResult> => {
 			try {
+				extra.signal.throwIfAborted()
 				logger.info(`[ToolBuilder] Direct invocation of tool: ${name}`)
 				// McpServer has already validated and transformed the input once.
-				const result = await handler(args as z.infer<S>, client)
+				const scopedClient =
+					typeof client === 'function' ? client(extra.signal) : client
+				const result = await handler(args as z.infer<S>, scopedClient, {
+					signal: extra.signal,
+				})
+				extra.signal.throwIfAborted()
 				return formatResponse(result)
 			} catch (error) {
+				if (extra.signal.aborted)
+					return {
+						isError: true,
+						content: [{ type: 'text', text: 'Request cancelled.' }],
+					}
 				logger.error(`Unexpected error in direct tool: ${name}`, {
 					error: error instanceof Error ? error.message : String(error),
 				})

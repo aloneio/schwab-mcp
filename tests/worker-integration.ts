@@ -167,8 +167,13 @@ await test(
 					decision: 'approve',
 				}).toString(),
 			})
-			assert.equal(approval.status, 302, await approval.clone().text())
-			const upstream = new URL(approval.headers.get('Location')!)
+			assert.equal(approval.status, 200, await approval.clone().text())
+			assert.equal(approval.headers.has('Location'), false)
+			const continuation = /id="continue" href="([^"]+)"/.exec(
+				await approval.text(),
+			)?.[1]
+			assert.ok(continuation)
+			const upstream = new URL(continuation.replaceAll('&amp;', '&'))
 			assert.equal(upstream.origin, 'https://api.schwabapi.com')
 			upstreamChallenge = upstream.searchParams.get('code_challenge')!
 			const callback = await mf.dispatchFetch(
@@ -176,6 +181,7 @@ await test(
 				{ headers: { Cookie: cookie }, redirect: 'manual' },
 			)
 			assert.equal(callback.status, 302, await callback.clone().text())
+			assert.match(callback.headers.get('Set-Cookie') ?? '', /Max-Age=0$/)
 			const clientCallback = new URL(callback.headers.get('Location')!)
 			assert.equal(clientCallback.origin, new URL(redirectUri).origin)
 			assert.equal(

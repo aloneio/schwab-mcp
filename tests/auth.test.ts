@@ -3,7 +3,8 @@ import test from 'node:test'
 import { type AuthRequest } from '@cloudflare/workers-oauth-provider'
 import { createSchwabTokenProvider } from '../src/auth/client'
 import {
-	ensureBrowserBinding,
+	clearBrowserBinding,
+	createBrowserBinding,
 	requireBrowserBinding,
 	requireSameOrigin,
 } from '../src/auth/cookies'
@@ -19,7 +20,10 @@ import {
 	responseRequestId,
 	type AuthStorage,
 } from '../src/auth/service'
-import { renderApprovalDialog } from '../src/auth/ui/approvalDialog'
+import {
+	renderApprovalDialog,
+	renderContinuePage,
+} from '../src/auth/ui/approvalDialog'
 import { type ValidatedEnv } from '../types/env'
 
 class MemoryStorage implements AuthStorage {
@@ -137,10 +141,8 @@ void test('authorization schema allows only read scope and PKCE S256', () => {
 
 void test('browser binding is signed and approval requires the page origin', async () => {
 	const secret = 'fixture-cookie-signing-key'.repeat(2)
-	const session = await ensureBrowserBinding(
-		new Request('https://server.example/authorize'),
-		secret,
-	)
+	const transaction = crypto.randomUUID()
+	const session = await createBrowserBinding(transaction, secret)
 	const request = new Request('https://server.example/authorize', {
 		headers: {
 			Cookie: session.cookie.split(';')[0]!,
@@ -148,16 +150,13 @@ void test('browser binding is signed and approval requires the page origin', asy
 		},
 	})
 	assert.equal(
-		await requireBrowserBinding(request, secret),
-		session.browserBinding,
-	)
-	assert.equal(
-		(await ensureBrowserBinding(request, secret)).browserBinding,
+		await requireBrowserBinding(request, transaction, secret),
 		session.browserBinding,
 	)
 	assert.match(session.cookie, /HttpOnly; Secure; SameSite=Lax; Path=\//)
+	assert.match(session.cookie, /Max-Age=600$/)
 	await assert.rejects(
-		requireBrowserBinding(request, 'other-fixture-key'.repeat(2)),
+		requireBrowserBinding(request, transaction, 'other-fixture-key'.repeat(2)),
 		{ code: 'browser_session_missing' },
 	)
 	requireSameOrigin(request)
@@ -165,6 +164,66 @@ void test('browser binding is signed and approval requires the page origin', asy
 		() => requireSameOrigin(new Request('https://server.example/authorize')),
 		{ code: 'invalid_origin' },
 	)
+})
+
+void test('simultaneous authorization tabs keep independent expiring browser bindings', async () => {
+	const secret = 'fixture-cookie-signing-key'.repeat(2)
+	let now = 1_800_000_000_000
+	const firstId = crypto.randomUUID()
+	const secondId = crypto.randomUUID()
+	const [first, second] = await Promise.all([
+		createBrowserBinding(firstId, secret, () => now),
+		createBrowserBinding(secondId, secret, () => now),
+	])
+	const firstCookie = first.cookie.split(';')[0]!
+	const secondCookie = second.cookie.split(';')[0]!
+	const request = new Request('https://server.example/authorize', {
+		headers: { Cookie: `${firstCookie}; ${secondCookie}` },
+	})
+	assert.equal(
+		await requireBrowserBinding(request, firstId, secret, () => now),
+		first.browserBinding,
+	)
+	assert.equal(
+		await requireBrowserBinding(request, secondId, secret, () => now),
+		second.browserBinding,
+	)
+	const renamedCookie = new Request(request.url, {
+		headers: { Cookie: firstCookie.replace(firstId, secondId) },
+	})
+	await assert.rejects(
+		requireBrowserBinding(renamedCookie, secondId, secret, () => now),
+		{ code: 'browser_session_missing' },
+	)
+	assert.match(
+		clearBrowserBinding(firstId),
+		new RegExp(`^__Host-schwab-oauth-${firstId}=;`),
+	)
+	assert.match(clearBrowserBinding(firstId), /Max-Age=0$/)
+	now += TRANSACTION_TTL_MS
+	await assert.rejects(
+		requireBrowserBinding(request, firstId, secret, () => now),
+		{ code: 'browser_session_missing' },
+	)
+})
+
+void test('cross-origin continuation uses an escaped link without a form redirect', async () => {
+	const response = renderContinuePage({
+		url: 'https://client.example/callback?error=access_denied&state=fixture',
+		approved: false,
+	})
+	assert.equal(response.status, 200)
+	assert.equal(response.headers.has('Location'), false)
+	assert.match(
+		response.headers.get('Content-Security-Policy')!,
+		/form-action 'self'/,
+	)
+	const html = await response.text()
+	assert.match(
+		html,
+		/href="https:\/\/client.example\/callback\?error=access_denied&amp;state=fixture"/,
+	)
+	assert.doesNotMatch(html, /<form|<script|http-equiv=["']refresh/i)
 })
 
 void test('consent page escapes ordinary metadata and never auto-submits', async () => {
@@ -184,6 +243,7 @@ void test('consent page escapes ordinary metadata and never auto-submits', async
 		/unsafe-inline/,
 	)
 	assert.equal(response.headers.get('Cache-Control'), 'no-store')
+	assert.equal(response.headers.get('Referrer-Policy'), 'same-origin')
 })
 
 void test('absolute expiry is stable and concurrent sessions refresh only once', async () => {

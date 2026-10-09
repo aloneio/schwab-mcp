@@ -35,7 +35,9 @@ export class MyMCP extends DurableObject<Env> {
 			if (!(await tokenProvider.initialize()))
 				return new Response('Reconnect and authorize Schwab.', { status: 401 })
 			this.owner = owner
-			this.server = createMcpServer(createReadOnlySchwabClient(tokenProvider))
+			this.server = createMcpServer((signal) =>
+				createReadOnlySchwabClient(tokenProvider, { signal }),
+			)
 			this.transport = new SchwabSseTransport(this.ctx.id.toString())
 			await this.server.connect(this.transport)
 			return this.transport.response
