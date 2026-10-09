@@ -1,18 +1,22 @@
 import {
-	buildAccountDisplayMap,
-	scrubAccountIdentifiers,
 	GetAccountByNumberParams,
 	GetAccountNumbersParams,
-	GetOrdersParams,
 	GetAccountsParams,
-	GetOrdersByAccountParams,
 	GetOrderByIdParams,
-	GetTransactionsParams,
 	GetTransactionByIdParams,
 	GetUserPreferenceParams,
 } from '@sudowealth/schwab-api'
+import {
+	buildAccountDisplayMap,
+	scrubAccountIdentifiers,
+} from '../../shared/accountPrivacy'
 import { logger } from '../../shared/log'
 import { createToolSpec } from '../types'
+import {
+	OrdersParams,
+	OrdersByAccountParams,
+	TransactionsParams,
+} from './schemas'
 
 export const toolSpecs = [
 	createToolSpec({
@@ -35,15 +39,16 @@ export const toolSpecs = [
 	}),
 	createToolSpec({
 		name: 'getAccountNumbers',
-		description: 'Get account numbers',
+		description:
+			'Get safe account labels and opaque account hashes for account-specific queries',
 		schema: GetAccountNumbersParams,
 		call: async (c, p) => {
 			logger.info('[getAccountNumbers] Fetching account numbers')
 			const accounts = await c.trader.accounts.getAccountNumbers(p)
-			const displayMap = await buildAccountDisplayMap(c)
+			const displayMap = await buildAccountDisplayMap(c, accounts)
 			return accounts.map((acc) => {
 				return {
-					accountDisplay: displayMap[acc.accountNumber],
+					accountDisplay: displayMap.get(acc.accountNumber) ?? 'Account',
 					hashValue: acc.hashValue,
 				}
 			})
@@ -56,6 +61,7 @@ export const toolSpecs = [
 		call: async (c, p) => {
 			const account = await c.trader.accounts.getAccountByNumber({
 				pathParams: { accountNumber: p.accountNumber },
+				queryParams: { fields: p.fields },
 			})
 			const displayMap = await buildAccountDisplayMap(c)
 			return scrubAccountIdentifiers(account, displayMap)
@@ -64,7 +70,7 @@ export const toolSpecs = [
 	createToolSpec({
 		name: 'getOrders',
 		description: 'Get orders',
-		schema: GetOrdersParams,
+		schema: OrdersParams,
 		call: async (c, p) => {
 			logger.info('[getOrders] Fetching orders', {
 				maxResults: p.maxResults,
@@ -78,11 +84,12 @@ export const toolSpecs = [
 	createToolSpec({
 		name: 'getOrdersByAccountNumber',
 		description: 'Get orders by account number',
-		schema: GetOrdersByAccountParams,
+		schema: OrdersByAccountParams,
 		call: async (c, p) => {
+			const { accountNumber, ...queryParams } = p
 			const orders = await c.trader.orders.getOrdersByAccount({
-				pathParams: { accountNumber: p.accountNumber },
-				queryParams: p,
+				pathParams: { accountNumber },
+				queryParams,
 			})
 			const displayMap = await buildAccountDisplayMap(c)
 			return scrubAccountIdentifiers(orders, displayMap)
@@ -102,11 +109,14 @@ export const toolSpecs = [
 	}),
 	createToolSpec({
 		name: 'getTransactions',
-		description: 'Get transactions',
-		schema: GetTransactionsParams,
+		description:
+			'Get transactions of the requested type. Omit accountNumber to read all linked accounts; provide an account hash to read only that account.',
+		schema: TransactionsParams,
 		call: async (c, p) => {
 			logger.info('[getTransactions] Fetching accounts')
-			const accounts = await c.trader.accounts.getAccountNumbers()
+			const accounts = p.accountNumber
+				? [{ hashValue: p.accountNumber }]
+				: await c.trader.accounts.getAccountNumbers()
 			if (accounts.length === 0) return []
 			logger.info('[getTransactions] Fetching transactions', {
 				accountCount: accounts.length,
@@ -129,7 +139,6 @@ export const toolSpecs = [
 					},
 				)
 				logger.debug('[getTransactions] Transactions for account', {
-					accountHash: account.hashValue,
 					count: accountTransactions.length,
 				})
 				transactions.push(...accountTransactions)
@@ -163,9 +172,6 @@ export const toolSpecs = [
 		call: async (c, p) => {
 			logger.info('[getUserPreference] Fetching user preference')
 			const userPreference = await c.trader.userPreference.getUserPreference(p)
-			if (userPreference.streamerInfo.length === 0) {
-				return []
-			}
 			logger.info('[getUserPreference] User preference fetched', {
 				hasAccounts: userPreference.accounts?.length > 0,
 				accountCount: userPreference.accounts?.length || 0,

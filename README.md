@@ -30,16 +30,16 @@ read-only and cannot place, replace, or cancel orders.
 This MCP server acts as a bridge between AI assistants and the Schwab API,
 providing:
 
-- **Secure OAuth Authentication**: Implements Schwab's OAuth 2.0 flow with PKCE
-  for secure authentication
+- **OAuth Authentication**: Browser-bound, expiring authorization transactions
+  with PKCE and explicit client consent
 - **Read-Only Brokerage Data**: Access to accounts, order history, quotes, and
   transactions without order execution
 - **Market Data Tools**: Real-time quotes, price history, market hours, movers,
   and options chains
 - **Account Privacy**: Built-in account identifier scrubbing to protect
   sensitive information
-- **Enterprise-Ready**: Deployed on Cloudflare Workers with Durable Objects for
-  state management
+- **Cloudflare Workers**: Durable Objects coordinate sessions and credential
+  storage
 
 ## Features
 
@@ -47,10 +47,11 @@ providing:
 
 - **Account Management**
   - `getAccounts`: Retrieve all account information with positions and balances
+  - `getAccount`: Retrieve one account, optionally including positions
   - `getAccountNumbers`: Get list of account identifiers
 - **Order History (Read-Only)**
   - `getOrder`: Get order by ID
-  - `getOrders`: Fetch orders with filtering by status, time range, and symbol
+  - `getOrders`: Fetch orders with filtering by status and time range
   - `getOrdersByAccountNumber`: Get orders by account number
 - **Market Quotes**
   - `getQuotes`: Get real-time quotes for multiple symbols
@@ -58,6 +59,7 @@ providing:
 - **Transaction History**
   - `getTransactions`: Retrieve transaction history across all accounts with
     date filtering
+  - `getTransaction`: Retrieve one transaction for an account
 - **User Preferences**
   - `getUserPreference`: Retrieve user trading preferences and settings
 
@@ -65,11 +67,20 @@ providing:
 > cannot place, replace, or cancel Schwab orders. Order endpoints in this
 > project are limited to read-only retrieval.
 
+The brokerage and market-data transport permits only `GET` requests to an
+explicit allowlist of Schwab read endpoints. Unsupported URLs, other methods,
+and redirects are rejected before a business request is sent. OAuth token
+exchange and refresh use a separate, fixed token endpoint and require `POST`;
+those authentication requests do not execute trades. The GET restriction does
+not reduce the permissions granted to the underlying Schwab application, so
+protect its credentials and use the intended app configuration.
+
 ### Market Data Tools
 
 - **Instrument Search**
   - `searchInstruments`: Search for securities by symbol with
     fundamental/reference data
+  - `getInstrumentByCusip`: Retrieve instrument information by CUSIP
 - **Price History**
   - `getPriceHistory`: Get historical price data with customizable periods and
     frequencies
@@ -86,9 +97,8 @@ providing:
 
 1. **Schwab Developer Account**: Register at
    [Schwab Developer Portal](https://developer.schwab.com)
-2. **Cloudflare Account**: For deployment (Workers paid plan required for
-   Durable Objects)
-3. **Node.js**: Version 22.x or higher
+2. **Cloudflare Account**: Workers, Workers KV, and SQLite Durable Objects
+3. **Node.js**: Version 22.x
 4. **Wrangler CLI**: Installed via npm (included in dev dependencies)
 
 ## Getting Started
@@ -96,15 +106,15 @@ providing:
 ### Quick Setup
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/aloneio/schwab-mcp.git
 cd schwab-mcp
-npm install
+npm ci
 
 # Authenticate with Cloudflare (first time only)
 npx wrangler login
 
-# Create KV namespace for OAuth token storage
-npx wrangler kv:namespace create "OAUTH_KV"
+# Create KV namespace for MCP OAuth client registrations and grants
+npx wrangler kv namespace create "OAUTH_KV"
 # Note the ID from the output - you'll need it for configuration
 
 # Set up your personal configuration
@@ -116,7 +126,7 @@ cp wrangler.example.jsonc wrangler.jsonc
 # Set your secrets
 npx wrangler secret put SCHWAB_CLIENT_ID      # Your Schwab App Key
 npx wrangler secret put SCHWAB_CLIENT_SECRET  # Your Schwab App Secret
-npx wrangler secret put SCHWAB_REDIRECT_URI   # https://your-worker-name.workers.dev/callback
+npx wrangler secret put SCHWAB_REDIRECT_URI   # https://your-worker-name.your-subdomain.workers.dev/callback
 npx wrangler secret put COOKIE_ENCRYPTION_KEY # Generate with: openssl rand -hex 32
 
 # Deploy
@@ -131,6 +141,21 @@ npm run deploy
 
 Since `wrangler.jsonc` is git-ignored, you can safely develop and test with your
 personal configuration without exposing secrets.
+
+`COOKIE_ENCRYPTION_KEY` is a retained configuration name for the random cookie
+**signing** secret; it does not imply encrypted cookies. Generate a fresh secret
+with `openssl rand -hex 32`. Configuration rejects values shorter than 32 UTF-8
+bytes. Never commit `.dev.vars` or share the generated secret.
+
+For an existing deployment, retain migration `v1` and add the template's `v2`
+migration plus the `SCHWAB_AUTH` binding for `SchwabAuthCoordinator`. Users must
+authorize again after this update: legacy Schwab credentials in KV are no longer
+read or migrated. `OAUTH_KV` remains required for MCP OAuth clients and grants.
+
+Use the exact origin of `SCHWAB_REDIRECT_URI` when connecting to `/sse`. The
+callback must use HTTPS and the `/callback` path, without a query or fragment.
+Requests using an alternate hostname receive HTTP 421 so authorization cannot
+start on a hostname that will not receive the browser cookie at callback time.
 
 ### Detailed Configuration
 
@@ -155,8 +180,15 @@ For automated deployments, add these GitHub repository secrets:
 1. **`CLOUDFLARE_API_TOKEN`**: Your Cloudflare API token
 2. **`OAUTH_KV_ID`**: Your KV namespace ID
 
-The workflow handles validation and deployment when pushing to `main`.
-Cloudflare secrets must still be set via `wrangler secret`.
+The workflow handles validation and deployment when pushing to `main`. It
+installs the lockfile with `npm ci` and runs validation and tests before
+deployment. Pull requests run these checks without deploying.
+
+Set the repository variable **`CLOUDFLARE_WORKER_NAME`** to the same Worker name
+as your personal configuration (default for CI: `schwab-mcp`). Set Cloudflare
+secrets on that exact Worker with
+`npx wrangler secret put <NAME> --name <WORKER>`; secrets attached to a
+different personal Worker are not copied by CI.
 
 ### Testing with Inspector
 
@@ -223,19 +255,25 @@ For local development, create a `.dev.vars` file (automatically ignored by git):
 ```env
 SCHWAB_CLIENT_ID=your_development_app_key
 SCHWAB_CLIENT_SECRET=your_development_app_secret
-SCHWAB_REDIRECT_URI=http://localhost:8788/callback
-COOKIE_ENCRYPTION_KEY=your_random_key_here
-LOG_LEVEL=DEBUG  # Optional: Enable debug logging
+SCHWAB_REDIRECT_URI=https://localhost:8788/callback
+COOKIE_ENCRYPTION_KEY=replace_with_your_generated_random_secret
+LOG_LEVEL=debug
+ENVIRONMENT=development
 ```
 
 Run locally:
 
 ```bash
 npm run dev
-# Server will be available at http://localhost:8788
+# Server will be available at https://localhost:8788
 ```
 
-Connect to `http://localhost:8788/sse` using the MCP Inspector for testing.
+Replace the secret placeholder with the output of `openssl rand -hex 32`.
+Connect to `https://localhost:8788/sse` using the MCP Inspector. Configure the
+exact HTTPS callback URL in your Schwab developer app and trust the local
+development certificate in the browser/client. Local testing uses local KV and
+Durable Object storage; real OAuth and market/account calls still contact
+Schwab.
 
 ## Architecture
 
@@ -244,23 +282,31 @@ Connect to `http://localhost:8788/sse` using the MCP Inspector for testing.
 - **Runtime**: Cloudflare Workers with Durable Objects
 - **Authentication**: OAuth 2.0 with PKCE via
   `@cloudflare/workers-oauth-provider`
-- **API Client**: `@sudowealth/schwab-api` for type-safe Schwab API access
-- **MCP Framework**: `@modelcontextprotocol/sdk` with `workers-mcp` adapter
-- **State Management**: KV storage for tokens, Durable Objects for session state
+- **API Client**: Local read-only HTTP adapter, with endpoint metadata and input
+  types from `@sudowealth/schwab-api`
+- **MCP Framework**: `@modelcontextprotocol/sdk` with Durable Object SSE
+  transport
+- **State Management**: KV for MCP OAuth registrations/grants; Durable Objects
+  for one-use authorization transactions, per-user Schwab tokens, and sessions
 
 ### Security Features
 
-1. **OAuth 2.0 with PKCE**: Secure authentication flow preventing authorization
-   code interception
-2. **Enhanced Token Management**:
-   - Centralized KV token store with automatic migration
-   - Automatic token refresh (5 minutes before expiration)
-   - 31-day token persistence with TTL
-3. **Account Scrubbing**: Sensitive account identifiers are automatically
-   replaced with display names
-4. **State Security**: HMAC-SHA256 signatures for state parameter integrity
-5. **Cookie Encryption**: Client approval state encrypted with AES-256
-6. **Secret Redaction**: Automatic masking of sensitive data in logs
+1. **Authorization transactions**: Original OAuth request and PKCE verifier stay
+   in a Durable Object. Transactions expire after 10 minutes and callbacks
+   consume them once.
+2. **Browser binding**: HMAC-SHA256 authenticates a random browser cookie with
+   `Secure`, `HttpOnly`, `SameSite=Lax`, and a `__Host-` name. Explicit approval
+   is required before continuing to Schwab.
+3. **Credential isolation**: Per-user Durable Objects store Schwab tokens and
+   serialize refresh operations. MCP sessions retain identity, not token copies.
+4. **Read-only business transport**: A URL and method allowlist limits brokerage
+   and market-data calls to supported `GET` endpoints.
+5. **Account scrubbing**: Account display labels replace supported account
+   identifier fields in tool results. Clients still receive the financial data
+   they request; this is not anonymization of the entire response.
+6. **Log redaction**: Structured secret and account fields are scrubbed
+   recursively before logging, including arrays and nested errors. Avoid putting
+   credentials or full response bodies in free-text log messages.
 
 ## Development
 
@@ -270,7 +316,11 @@ Connect to `http://localhost:8788/sse` using the MCP Inspector for testing.
 npm run dev          # Start development server on port 8788
 npm run deploy       # Deploy to Cloudflare Workers
 npm run typecheck    # Run TypeScript type checking
-npm run lint         # Run ESLint with automatic fixes
+npm run lint         # Check ESLint rules
+npm test             # Run local regression tests
+npm run test:integration # Build and exercise the local Worker with a fixture upstream
+npm run test:integration # Bundle and run mock OAuth/SSE in a real local Worker
+npm run build        # Bundle with Wrangler without uploading
 npm run format       # Format code with Prettier
 npm run validate     # Run typecheck and lint together
 ```
@@ -279,29 +329,44 @@ npm run validate     # Run typecheck and lint together
 
 The server includes comprehensive logging with configurable levels:
 
-- **Development**: Terminal output with colored logs
+- **Development**: Structured terminal logs
 - **Production**: Cloudflare dashboard → Workers → Logs
-- **Log Levels**: DEBUG, INFO, WARN, ERROR (set via LOG_LEVEL env var)
+- **Log Levels**: trace, debug, info, warn, error, fatal (`LOG_LEVEL`,
+  case-insensitive)
 
 Enable debug logging to see detailed OAuth flow and API interactions:
 
 ```bash
 # For local development
-echo "LOG_LEVEL=DEBUG" >> .dev.vars
+echo "LOG_LEVEL=debug" >> .dev.vars
 
 # For production
-npx wrangler secret put LOG_LEVEL --secret="DEBUG"
+npx wrangler secret put LOG_LEVEL
+# Enter debug at the prompt (use --name if targeting a different Worker)
 ```
 
 ### Error Handling
 
-The server implements robust error handling with specific error types:
+Authentication routes return HTTP errors, while tool failures use MCP's
+`isError` response. Error messages distinguish invalid input, authentication,
+and upstream failures. Schwab request IDs are included when the upstream error
+provides them; not every failure has a request ID.
 
-- **Authentication Errors (401)**: Prompt for re-authentication
-- **Client Errors (400)**: Invalid parameters, missing data
-- **Server Errors (500)**: API failures, configuration issues
-- **Network Errors (503)**: Automatic retry with backoff
-- All errors include request IDs for Schwab API troubleshooting
+### Verification Scope
+
+`npm test` exercises local regression cases with synthetic data and mocked
+upstream requests. `npm run validate` checks TypeScript and ESLint. A Wrangler
+dry-run verifies that the Worker bundles. `npm run test:integration` also runs
+the bundled Worker in Miniflare with real local KV and SQLite Durable Objects,
+using an outbound fixture for every Schwab call. It checks OAuth discovery,
+registration, consent, PKCE, token issuance, SSE initialization, tool discovery,
+status, a quote request, and reauthorization after credential invalidation. CI
+runs both test suites. None of these checks proves that real Schwab
+authorization, token refresh, permissions, or live account/market responses
+work. A credentialed end-to-end check is a separate step and must use the
+intended account and deployment. Dependency audit counts describe installed
+packages; assess the deployed bundle and feature usage before treating each
+advisory as a reachable production issue.
 
 ## Contributing
 
@@ -322,7 +387,7 @@ MIT
 1. **"KV namespace not found" error**
 
    - Ensure you created the KV namespace and updated `wrangler.jsonc`
-   - Run `npx wrangler kv:namespace list` to verify
+   - Run `npx wrangler kv namespace list` to verify
 
 2. **Authentication failures**
 
@@ -332,21 +397,19 @@ MIT
 
 3. **"Durable Objects not available" error**
 
-   - Ensure you have a paid Cloudflare Workers plan
-   - Durable Objects are not available on the free tier
+   - Check that both `MCP_OBJECT` and `SCHWAB_AUTH` bindings are configured
+   - Retain migration `v1` and add the template's `v2` migration
 
 4. **Token refresh issues**
-   - The server automatically refreshes tokens 5 minutes before expiration
-   - Tokens are migrated from clientId to schwabUserId keys automatically
-   - Check KV namespace for stored tokens:
-     `npx wrangler kv:key list --namespace-id=<your-id>`
+   - Reauthorize when Schwab rejects an expired or revoked refresh token
+   - Confirm the `SCHWAB_AUTH` Durable Object binding and secrets are present
+   - Existing KV credentials are not reused; reauthorize after upgrading
 
 ## Recent Updates
 
-- **Enhanced Token Management**: Centralized KV token store prevents token
-  divergence
-- **Improved Security**: HMAC-SHA256 state validation and automatic secret
-  redaction
+- **Token Management**: Per-user Durable Objects coordinate credential updates
+- **OAuth Transactions**: Expiring, browser-bound, one-use authorization state
+- **Read-Only Transport**: A GET-only endpoint allowlist for business API calls
 - **Better Error Handling**: Structured error types with Schwab API error
   mapping
 - **Configurable Logging**: Debug mode for troubleshooting OAuth and API issues

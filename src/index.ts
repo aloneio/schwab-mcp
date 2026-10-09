@@ -1,338 +1,166 @@
-import OAuthProvider from '@cloudflare/workers-oauth-provider'
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
-import {
-	createApiClient,
-	sanitizeKeyForLog,
-	type SchwabApiClient,
-	type EnhancedTokenManager,
-	type SchwabApiLogger,
-	type TokenData,
-} from '@sudowealth/schwab-api'
-import { DurableMCP } from 'workers-mcp'
-import { type ValidatedEnv } from '../types/env'
-import { SchwabHandler, initializeSchwabAuthClient } from './auth'
+import OAuthProvider, { OAuthError } from '@cloudflare/workers-oauth-provider'
+import { DurableObject } from 'cloudflare:workers'
+import { SchwabHandler, createSchwabTokenProvider } from './auth'
+import { AuthServiceError } from './auth/service'
 import { getConfig } from './config'
+import { createMcpServer } from './mcp/server'
 import {
-	APP_NAME,
-	API_ENDPOINTS,
-	LOGGER_CONTEXTS,
-	TOOL_NAMES,
-	ENVIRONMENTS,
-	CONTENT_TYPES,
-	APP_SERVER_NAME,
-} from './shared/constants'
-import { makeKvTokenStore, type TokenIdentifiers } from './shared/kvTokenStore'
-import { logger, buildLogger, type PinoLogLevel } from './shared/log'
-import { logOnlyInDevelopment } from './shared/secureLogger'
-import { createTool, toolError, toolSuccess } from './shared/toolBuilder'
-import { allToolSpecs, type ToolSpec } from './tools'
+	readSessionOwner,
+	sameSessionOwner,
+	type SessionOwner,
+} from './mcp/session'
+import { SchwabSseTransport } from './mcp/transport'
+import { createReadOnlySchwabClient } from './shared/schwabReadClient'
 
-/**
- * DO props now contain only IDs needed for token key derivation
- * Tokens are stored exclusively in KV to prevent divergence
- */
-type MyMCPProps = {
-	/** Schwab user ID when available (preferred for token key) */
-	schwabUserId?: string
-	/** OAuth client ID (fallback for token key) */
-	clientId?: string
-}
+export { SchwabAuthCoordinator } from './auth/coordinator'
 
-export class MyMCP extends DurableMCP<MyMCPProps, Env> {
-	private tokenManager!: EnhancedTokenManager
-	private client!: SchwabApiClient
-	private validatedConfig!: ValidatedEnv
-	private mcpLogger = logger.child(LOGGER_CONTEXTS.MCP_DO)
+/** One MCP server per connection. Credentials live exclusively in the user auth DO. */
+export class MyMCP extends DurableObject<Env> {
+	private owner?: SessionOwner
+	private transport?: SchwabSseTransport
+	private server?: ReturnType<typeof createMcpServer>
 
-	server = new McpServer({
-		name: APP_NAME,
-		version: '0.0.1',
-	})
-
-	async init() {
+	async open(request: Request, props: unknown): Promise<Response> {
+		const owner = readSessionOwner(props)
+		if (!owner)
+			return new Response('Reconnect and authorize Schwab.', { status: 401 })
+		if (this.transport)
+			return new Response('Session already connected.', { status: 409 })
 		try {
-			// Register a minimal tool synchronously to ensure Claude Desktop detects tools
-			this.server.tool(
-				TOOL_NAMES.STATUS,
-				'Check Schwab MCP server status',
-				{},
-				async () => ({
-					content: [
-						{
-							type: CONTENT_TYPES.TEXT,
-							text: `${APP_SERVER_NAME} is running. Use tool discovery to see all available tools.`,
-						},
-					],
-				}),
+			const config = getConfig(this.env)
+			const tokenProvider = createSchwabTokenProvider(
+				config,
+				owner.schwabUserId,
 			)
-			this.validatedConfig = getConfig(this.env)
-			// Initialize logger with configured level
-			const logLevel = this.validatedConfig.LOG_LEVEL as PinoLogLevel
-			const newLogger = buildLogger(logLevel)
-			// Replace the singleton logger instance
-			Object.assign(logger, newLogger)
-			const redirectUri = this.validatedConfig.SCHWAB_REDIRECT_URI
-
-			this.mcpLogger.debug('[MyMCP.init] STEP 0: Start')
-			this.mcpLogger.debug('[MyMCP.init] STEP 1: Env initialized.')
-
-			// Create KV token store - single source of truth
-			const kvToken = makeKvTokenStore(this.validatedConfig.OAUTH_KV)
-
-			// Ensure clientId is stored in props for token key derivation
-			if (!this.props.clientId) {
-				this.props.clientId = this.validatedConfig.SCHWAB_CLIENT_ID
-				this.props = { ...this.props }
-			}
-
-			const getTokenIds = (): TokenIdentifiers => ({
-				schwabUserId: this.props.schwabUserId,
-				clientId: this.props.clientId,
-			})
-
-			// Debug token IDs during initialization
-			logOnlyInDevelopment(
-				this.mcpLogger,
-				'debug',
-				'[MyMCP.init] Token identifiers',
-				{
-					hasSchwabUserId: !!this.props.schwabUserId,
-					hasClientId: !!this.props.clientId,
-					expectedKeyPrefix: sanitizeKeyForLog(kvToken.kvKey(getTokenIds())),
-				},
-			)
-
-			// Token save function uses KV store exclusively
-			const saveTokenForETM = async (tokenSet: TokenData) => {
-				await kvToken.save(getTokenIds(), tokenSet)
-				this.mcpLogger.debug('ETM: Token save to KV complete', {
-					keyPrefix: sanitizeKeyForLog(kvToken.kvKey(getTokenIds())),
-				})
-			}
-
-			// Token load function uses KV store exclusively
-			const loadTokenForETM = async (): Promise<TokenData | null> => {
-				const tokenIds = getTokenIds()
-				this.mcpLogger.debug('[ETM Load] Attempting to load token', {
-					hasSchwabUserId: !!tokenIds.schwabUserId,
-					hasClientId: !!tokenIds.clientId,
-					expectedKeyPrefix: sanitizeKeyForLog(kvToken.kvKey(tokenIds)),
-				})
-
-				const tokenData = await kvToken.load(tokenIds)
-				this.mcpLogger.debug('ETM: Token load from KV complete', {
-					keyPrefix: sanitizeKeyForLog(kvToken.kvKey(tokenIds)),
-				})
-				return tokenData
-			}
-
-			this.mcpLogger.debug(
-				'[MyMCP.init] STEP 2: Storage and event handlers defined.',
-			)
-
-			// 1. Create ETM instance (synchronous)
-			const hadExistingTokenManager = !!this.tokenManager
-			this.mcpLogger.debug('[MyMCP.init] STEP 3A: ETM instance setup', {
-				hadExisting: hadExistingTokenManager,
-			})
-			if (!this.tokenManager) {
-				this.tokenManager = initializeSchwabAuthClient(
-					this.validatedConfig,
-					redirectUri,
-					loadTokenForETM,
-					saveTokenForETM,
-				) // This is synchronous
-			}
-			this.mcpLogger.debug('[MyMCP.init] STEP 3B: ETM instance ready', {
-				wasReused: hadExistingTokenManager,
-			})
-
-			const mcpLogger: SchwabApiLogger = {
-				debug: (message: string, ...args: any[]) =>
-					this.mcpLogger.debug(message, args.length > 0 ? args[0] : undefined),
-				info: (message: string, ...args: any[]) =>
-					this.mcpLogger.info(message, args.length > 0 ? args[0] : undefined),
-				warn: (message: string, ...args: any[]) =>
-					this.mcpLogger.warn(message, args.length > 0 ? args[0] : undefined),
-				error: (message: string, ...args: any[]) =>
-					this.mcpLogger.error(message, args.length > 0 ? args[0] : undefined),
-			}
-			this.mcpLogger.debug('[MyMCP.init] STEP 4: MCP Logger adapted.')
-
-			// 2. Proactively initialize ETM to load tokens BEFORE creating client
-			this.mcpLogger.debug(
-				'[MyMCP.init] STEP 5A: Proactively calling this.tokenManager.initialize() (async)...',
-			)
-			const etmInitSuccess = this.tokenManager.initialize()
-			this.mcpLogger.debug(
-				`[MyMCP.init] STEP 5B: Proactive ETM initialization complete. Success: ${etmInitSuccess}`,
-			)
-
-			// 2.5. Auto-migrate tokens if we have schwabUserId but token was loaded from clientId key
-			if (this.props.schwabUserId && this.props.clientId) {
-				await kvToken.migrateIfNeeded(
-					{ clientId: this.props.clientId },
-					{ schwabUserId: this.props.schwabUserId },
-				)
-				this.mcpLogger.debug('[MyMCP.init] STEP 5C: Token migration completed')
-			}
-
-			// 3. Create SchwabApiClient AFTER tokens are loaded
-			this.client = createApiClient({
-				config: {
-					environment: ENVIRONMENTS.PRODUCTION,
-					logger: mcpLogger,
-					enableLogging: true,
-					logLevel:
-						this.validatedConfig.ENVIRONMENT === 'production'
-							? 'error'
-							: 'debug',
-				},
-				auth: this.tokenManager,
-			})
-			this.mcpLogger.debug('[MyMCP.init] STEP 6: SchwabApiClient ready.')
-
-			// 4. Register tools (this.server.tool calls are synchronous)
-			this.mcpLogger.debug('[MyMCP.init] STEP 7A: Calling registerTools...')
-			allToolSpecs.forEach((spec: ToolSpec<any>) => {
-				createTool(this.client, this.server, {
-					name: spec.name,
-					description: spec.description,
-					schema: spec.schema,
-					handler: async (params, c) => {
-						try {
-							const data = await spec.call(c, params)
-							return toolSuccess({
-								data,
-								source: spec.name,
-								message: `Successfully executed ${spec.name}`,
-							})
-						} catch (error) {
-							return toolError(error, { source: spec.name })
-						}
-					},
-				})
-			})
-			this.mcpLogger.debug('[MyMCP.init] STEP 7B: registerTools completed.')
-			this.mcpLogger.debug(
-				'[MyMCP.init] STEP 8: MyMCP.init FINISHED SUCCESSFULLY',
-			)
-		} catch (error: any) {
-			this.mcpLogger.error(
-				'[MyMCP.init] FINAL CATCH: UNHANDLED EXCEPTION in init()',
-				{
-					error: error.message,
-					stack: error.stack,
-				},
-			)
-			throw error // Re-throw to ensure DO framework sees the failure
-		}
-	}
-
-	async onReconnect() {
-		this.mcpLogger.info('Handling reconnection in MyMCP instance')
-		try {
-			if (!this.tokenManager) {
-				this.mcpLogger.warn(
-					'Token manager not initialized, attempting full initialization',
-				)
-				await this.init()
-				return true
-			}
-			this.mcpLogger.info('Attempting reconnection via token manager')
-
-			try {
-				this.mcpLogger.info('Attempting to fetch access token as recovery test')
-				const token = await this.tokenManager.getAccessToken()
-				if (token) {
-					this.mcpLogger.info(
-						'Successfully retrieved access token during reconnection',
-					)
-					return true
-				}
-			} catch (tokenError) {
-				this.mcpLogger.warn('Failed to get access token during reconnection', {
-					error:
-						tokenError instanceof Error
-							? tokenError.message
-							: String(tokenError),
-				})
-			}
-
-			try {
-				this.mcpLogger.info(
-					'Attempting proactive reinitialization of token manager',
-				)
-				const initResult = await this.tokenManager.initialize()
-				this.mcpLogger.info(
-					`Token manager reinitialization ${initResult ? 'succeeded' : 'failed'}`,
-				)
-				if (initResult) {
-					return true
-				}
-			} catch (initError) {
-				this.mcpLogger.warn('Token manager reinitialization failed', {
-					error:
-						initError instanceof Error ? initError.message : String(initError),
-				})
-			}
-
-			try {
-				this.mcpLogger.info('Token manager state during reconnection', {
-					hasTokenManager: !!this.tokenManager,
-				})
-			} catch (stateError) {
-				this.mcpLogger.warn(
-					'Failed to check token manager state during reconnection',
-					{
-						error:
-							stateError instanceof Error
-								? stateError.message
-								: String(stateError),
-					},
-				)
-			}
-
-			this.mcpLogger.warn(
-				'Reconnection recovery attempts failed, performing full reinitialization',
-			)
-			await this.init()
-			return true
+			if (!(await tokenProvider.initialize()))
+				return new Response('Reconnect and authorize Schwab.', { status: 401 })
+			this.owner = owner
+			this.server = createMcpServer(createReadOnlySchwabClient(tokenProvider))
+			this.transport = new SchwabSseTransport(this.ctx.id.toString())
+			await this.server.connect(this.transport)
+			return this.transport.response
 		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error)
-			const stack = error instanceof Error ? error.stack : undefined
-			this.mcpLogger.error('Critical error during reconnection handling', {
-				error: message,
-				stack,
-			})
-			try {
-				this.mcpLogger.warn(
-					'Attempting emergency reinitialization after reconnection failure',
+			await this.transport?.close()
+			if (error instanceof AuthServiceError)
+				return Response.json(
+					{
+						code: error.code,
+						message: error.message,
+						requestId: error.requestId,
+					},
+					{ status: error.status },
 				)
-				await this.init()
-				return true
-			} catch (initError) {
-				const initMessage =
-					initError instanceof Error ? initError.message : String(initError)
-				this.mcpLogger.error('Emergency reinitialization also failed', {
-					error: initMessage,
-				})
-				return false
-			}
+			return new Response(
+				'Unable to initialize Schwab. Reconnect to try again.',
+				{ status: 503 },
+			)
 		}
 	}
 
-	async onSSE(event: any) {
-		this.mcpLogger.info('SSE connection established or reconnected')
-		await this.onReconnect()
-		return await super.onSSE(event)
+	async message(request: Request, props: unknown): Promise<Response> {
+		if (!sameSessionOwner(this.owner, readSessionOwner(props)))
+			return new Response(
+				'MCP session does not belong to this authorization.',
+				{ status: 403 },
+			)
+		if (!this.transport)
+			return new Response('Reconnect the MCP session.', { status: 410 })
+		return this.transport.accept(request)
 	}
 }
 
-export default new OAuthProvider({
-	apiRoute: API_ENDPOINTS.SSE,
-	apiHandler: MyMCP.mount(API_ENDPOINTS.SSE) as any, // Cast remains due to library typing
-	defaultHandler: SchwabHandler as any, // Cast remains
-	authorizeEndpoint: API_ENDPOINTS.AUTHORIZE,
-	tokenEndpoint: API_ENDPOINTS.TOKEN,
-})
+const apiHandler = {
+	async fetch(
+		request: Request,
+		env: Env,
+		ctx: ExecutionContext,
+	): Promise<Response> {
+		const url = new URL(request.url)
+		const owner = readSessionOwner(ctx.props)
+		if (!owner)
+			return new Response('Reconnect and authorize Schwab.', { status: 401 })
+		const auth = (ctx as ExecutionContext & { auth?: { scope?: string[] } })
+			.auth
+		if (!auth?.scope?.includes('read'))
+			return new Response('Read authorization is required.', {
+				status: 403,
+				headers: {
+					'WWW-Authenticate': 'Bearer error="insufficient_scope", scope="read"',
+				},
+			})
+		if (url.pathname === '/sse' && request.method === 'GET') {
+			const object = env.MCP_OBJECT.get(env.MCP_OBJECT.newUniqueId())
+			return object.open(request, owner)
+		}
+		if (url.pathname === '/sse/message' && request.method === 'POST') {
+			const id = url.searchParams.get('sessionId')
+			if (!id || !/^[a-f0-9]{64}$/i.test(id))
+				return new Response('Invalid MCP session.', { status: 400 })
+			try {
+				return await env.MCP_OBJECT.get(
+					env.MCP_OBJECT.idFromString(id),
+				).message(request, owner)
+			} catch {
+				return new Response('Reconnect the MCP session.', { status: 410 })
+			}
+		}
+		return new Response('Not found', { status: 404 })
+	},
+}
+
+export default {
+	async fetch(
+		request: Request,
+		env: Env,
+		ctx: ExecutionContext,
+	): Promise<Response> {
+		try {
+			const config = getConfig(env)
+			const resource = new URL('/sse', config.SCHWAB_REDIRECT_URI).href
+			if (new URL(request.url).origin !== new URL(resource).origin)
+				return new Response('Use the configured MCP server origin.', {
+					status: 421,
+				})
+			return await new OAuthProvider<Env>({
+				apiRoute: '/sse',
+				apiHandler,
+				defaultHandler: SchwabHandler,
+				authorizeEndpoint: '/authorize',
+				tokenEndpoint: '/token',
+				clientRegistrationEndpoint: '/register',
+				scopesSupported: ['read'],
+				requiredScopes: ['read'],
+				resourceMetadata: { resource, resource_name: 'Schwab read-only MCP' },
+				tokenExchangeCallback: async ({ props, userId, clientId }) => {
+					const owner = readSessionOwner(props)
+					if (
+						!owner ||
+						owner.schwabUserId !== userId ||
+						owner.clientId !== clientId
+					)
+						throw new OAuthError('invalid_grant', {
+							description: 'Reconnect and authorize Schwab.',
+						})
+					try {
+						await createSchwabTokenProvider(config, userId).getAccessToken()
+					} catch (error) {
+						if (error instanceof AuthServiceError && error.status === 401)
+							throw new OAuthError('invalid_grant', {
+								description: 'Reconnect and authorize Schwab.',
+							})
+						throw new OAuthError('temporarily_unavailable', {
+							description: 'Schwab authentication is temporarily unavailable.',
+							statusCode:
+								error instanceof AuthServiceError ? error.status : 503,
+						})
+					}
+				},
+			}).fetch(request, env, ctx)
+		} catch {
+			return new Response(
+				'Schwab MCP is temporarily unavailable. Check server configuration.',
+				{ status: 503 },
+			)
+		}
+	},
+}

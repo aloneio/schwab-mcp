@@ -4,23 +4,17 @@ export * from './types'
 // Auto-registration of tools
 import * as market from './market'
 import * as trader from './trader'
-
-const WRITE_TRADING_TOOL_NAMES = new Set([
-	'placeOrder',
-	'replaceOrder',
-	'cancelOrder',
-])
+import { READ_ONLY_TOOL_NAMES } from './types'
 
 export const allToolSpecs = [...trader.toolSpecs, ...market.toolSpecs]
 
-const exposedWriteTradingTools = allToolSpecs.filter((spec) =>
-	WRITE_TRADING_TOOL_NAMES.has(spec.name),
-)
-
-if (exposedWriteTradingTools.length > 0) {
+const registeredNames = new Set(allToolSpecs.map((spec) => spec.name))
+if (
+	registeredNames.size !== allToolSpecs.length ||
+	registeredNames.size !== READ_ONLY_TOOL_NAMES.length ||
+	READ_ONLY_TOOL_NAMES.some((name) => !registeredNames.has(name))
+) {
 	throw new Error(
-		`Read-only policy violation: trading tools exposed: ${exposedWriteTradingTools
-			.map((spec) => spec.name)
-			.join(', ')}`,
+		'Tool registry does not match the explicit read-only tool allowlist',
 	)
 }

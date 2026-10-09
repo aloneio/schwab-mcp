@@ -1,3 +1,5 @@
+import { type SchwabAuthCoordinator } from '../src/auth/coordinator'
+
 /**
  * Environment variables and bindings for the Schwab MCP worker
  *
@@ -16,7 +18,7 @@ export interface Env {
 	SCHWAB_CLIENT_SECRET: string
 
 	/**
-	 * Secret key used for cookie encryption
+	 * At least 32 UTF-8 bytes of random secret material for browser cookie signatures
 	 */
 	COOKIE_ENCRYPTION_KEY: string
 
@@ -28,9 +30,12 @@ export interface Env {
 	SCHWAB_REDIRECT_URI: string
 
 	/**
-	 * KV namespace for storing tokens (required)
+	 * KV namespace for MCP OAuth clients and grants (not Schwab credentials)
 	 */
 	OAUTH_KV: KVNamespace
+
+	/** Serializes OAuth transactions and per-user Schwab token operations. */
+	SCHWAB_AUTH: DurableObjectNamespace<SchwabAuthCoordinator>
 
 	/**
 	 * Optional log level for application logging
@@ -66,7 +71,7 @@ export interface ValidatedEnv {
 	readonly SCHWAB_CLIENT_SECRET: string
 
 	/**
-	 * Secret key used for cookie encryption
+	 * At least 32 UTF-8 bytes of random secret material for browser cookie signatures
 	 */
 	readonly COOKIE_ENCRYPTION_KEY: string
 
@@ -76,9 +81,11 @@ export interface ValidatedEnv {
 	readonly SCHWAB_REDIRECT_URI: string
 
 	/**
-	 * KV namespace for storing tokens (required)
+	 * KV namespace for MCP OAuth clients and grants (not Schwab credentials)
 	 */
 	readonly OAUTH_KV: KVNamespace
+
+	readonly SCHWAB_AUTH: DurableObjectNamespace<SchwabAuthCoordinator>
 
 	/**
 	 * Optional log level for application logging

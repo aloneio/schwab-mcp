@@ -1,11 +1,5 @@
-/**
- * Lightweight Pino logger wrapper for Cloudflare Workers
- * Provides structured logging with automatic secret redaction
- */
-
 import pino from 'pino'
 
-// Pino log levels
 export type PinoLogLevel =
 	| 'trace'
 	| 'debug'
@@ -14,177 +8,160 @@ export type PinoLogLevel =
 	| 'error'
 	| 'fatal'
 
-// Logger type that matches our existing interface
-interface AppLogger {
-	debug: (message: string, data?: any, contextId?: string) => void
-	info: (message: string, data?: any, contextId?: string) => void
-	warn: (message: string, data?: any, contextId?: string) => void
-	error: (message: string, data?: any, contextId?: string) => void
+type LogMethod = 'debug' | 'info' | 'warn' | 'error'
+type LogFunction = (message: string, data?: unknown, contextId?: string) => void
+type ChildLogger = Record<LogMethod, LogFunction>
+
+export interface AppLogger extends ChildLogger {
 	child: (contextId: string) => ChildLogger
+	setLevel: (level: PinoLogLevel) => void
 }
 
-// Child logger interface
-interface ChildLogger {
-	debug: (message: string, data?: any, contextId?: string) => void
-	info: (message: string, data?: any, contextId?: string) => void
-	warn: (message: string, data?: any, contextId?: string) => void
-	error: (message: string, data?: any, contextId?: string) => void
+type LogWriter = (
+	level: LogMethod,
+	entry: Record<string, unknown>,
+	message: string,
+) => void
+
+const LEVELS: Record<PinoLogLevel, number> = {
+	trace: 10,
+	debug: 20,
+	info: 30,
+	warn: 40,
+	error: 50,
+	fatal: 60,
 }
 
-// Redaction paths for sensitive data
-const REDACT_PATHS = [
+const SENSITIVE_KEYS = new Set([
 	'password',
 	'secret',
 	'token',
 	'key',
 	'auth',
 	'authorization',
+	'proxyauthorization',
 	'cookie',
+	'setcookie',
 	'session',
-	'accessToken',
-	'refreshToken',
-	'api_key',
-	'apiKey',
-	'client_secret',
-	'clientSecret',
-	'schwabUserId',
-	'clientId',
-	'accountNumber',
-	'hashValue',
-	'schwabClientCorrelId',
-	'sourceKey',
-	'expectedKey',
-	'tokenKey',
-	'fromKey',
-	'toKey',
-	'*.password',
-	'*.secret',
-	'*.token',
-	'*.key',
-	'*.auth',
-	'*.authorization',
-	'*.cookie',
-	'*.session',
-	'*.accessToken',
-	'*.refreshToken',
-	'*.api_key',
-	'*.apiKey',
-	'*.client_secret',
-	'*.clientSecret',
-	'*.schwabUserId',
-	'*.clientId',
-	'*.accountNumber',
-	'*.hashValue',
-	'*.schwabClientCorrelId',
-	'*.sourceKey',
-	'*.expectedKey',
-	'*.tokenKey',
-	'*.fromKey',
-	'*.toKey',
-]
+	'sessionid',
+	'accesstoken',
+	'refreshtoken',
+	'idtoken',
+	'credentials',
+	'privatekey',
+	'cookieencryptionkey',
+	'apikey',
+	'clientsecret',
+	'schwabclientsecret',
+	'schwabclientid',
+	'schwabuserid',
+	'clientid',
+	'accountnumber',
+	'accountid',
+	'accounthash',
+	'hashvalue',
+	'schwabclientcorrelid',
+	'sourcekey',
+	'expectedkey',
+	'tokenkey',
+	'fromkey',
+	'tokey',
+	'state',
+	'oauthstate',
+	'code',
+	'authorizationcode',
+	'codeverifier',
+])
 
-// Custom serializers for additional redaction
-const serializers = {
-	// Redact authorization headers
-	req: (req: any) => {
-		const serialized = pino.stdSerializers.req(req)
-		if (serialized.headers?.authorization) {
-			serialized.headers.authorization = '[REDACTED]'
+/** Clean structured data before it reaches either Pino's Node or browser writer. */
+export function redactLogData(value: unknown): unknown {
+	const ancestors = new WeakSet<object>()
+	const visit = (item: unknown): unknown => {
+		if (typeof item !== 'object' || item === null) return item
+		if (ancestors.has(item)) return '[Circular]'
+		ancestors.add(item)
+		try {
+			if (item instanceof Date) return item.toISOString()
+			if (Array.isArray(item)) return item.map(visit)
+			const source =
+				item instanceof Headers
+					? Object.fromEntries(item.entries())
+					: item instanceof Error
+						? {
+								...item,
+								name: item.name,
+								message: item.message,
+								stack: item.stack,
+								...(item.cause === undefined ? {} : { cause: item.cause }),
+							}
+						: item
+			return Object.fromEntries(
+				Object.entries(source).map(([key, entry]) => {
+					const normalized = key.replace(/[^a-z0-9]/gi, '').toLowerCase()
+					return [
+						key,
+						SENSITIVE_KEYS.has(normalized) ? '[REDACTED]' : visit(entry),
+					]
+				}),
+			)
+		} finally {
+			ancestors.delete(item)
 		}
-		if (serialized.headers?.cookie) {
-			serialized.headers.cookie = '[REDACTED]'
-		}
-		return serialized
-	},
-	// Redact sensitive error properties
-	err: (err: any) => {
-		const serialized = pino.stdSerializers.err(err)
-		// Add any custom error redaction here if needed
-		return serialized
-	},
+	}
+	return visit(value)
 }
 
-// Pino configuration for Cloudflare Workers
-const pinoConfig: pino.LoggerOptions = {
-	// Use browser transport for console output in Workers
-	browser: {
-		asObject: false,
-		serialize: true,
-	},
-	// Set redaction paths
-	redact: {
-		paths: REDACT_PATHS,
-		censor: '[REDACTED]',
-	},
-	// Custom serializers
-	serializers,
-	// Format timestamps
-	timestamp: pino.stdTimeFunctions.isoTime,
-	// Base context
-	base: {
-		env: 'cloudflare-worker',
-	},
-}
+/** Children share mutable level state and never capture obsolete Pino methods. */
+export function buildLogger(
+	level: PinoLogLevel = 'info',
+	writer?: LogWriter,
+): AppLogger {
+	const baseLogger = writer
+		? undefined
+		: pino({
+				level: 'trace',
+				browser: { asObject: true },
+				timestamp: pino.stdTimeFunctions.isoTime,
+				base: { env: 'cloudflare-worker' },
+			})
+	const write: LogWriter =
+		writer ?? ((method, entry, message) => baseLogger![method](entry, message))
 
-/**
- * Build a logger instance with the specified log level
- */
-export function buildLogger(level: PinoLogLevel = 'info'): AppLogger {
-	// Create base pino instance
-	const baseLogger = pino({
-		...pinoConfig,
-		level,
-	})
-
-	// Create wrapper that matches our existing interface
-	const createLogFunction = (
-		logFn: pino.LogFn,
-	): ((message: string, data?: any, contextId?: string) => void) => {
-		return (message: string, data?: any, contextId?: string) => {
-			if (contextId) {
-				logFn({ contextId, ...data }, message)
-			} else if (data !== undefined) {
-				logFn(data, message)
-			} else {
-				logFn(message)
+	const methods = (contextId?: string): ChildLogger => {
+		const method = (methodLevel: LogMethod): LogFunction => {
+			return (message, data, additionalContextId) => {
+				if (LEVELS[methodLevel] < LEVELS[level]) return
+				write(
+					methodLevel,
+					{
+						...(additionalContextId || contextId
+							? { contextId: additionalContextId || contextId }
+							: {}),
+						...(data === undefined ? {} : { data: redactLogData(data) }),
+					},
+					message,
+				)
 			}
+		}
+		return {
+			debug: method('debug'),
+			info: method('info'),
+			warn: method('warn'),
+			error: method('error'),
 		}
 	}
 
-	const logger: AppLogger = {
-		debug: createLogFunction(baseLogger.debug.bind(baseLogger)),
-		info: createLogFunction(baseLogger.info.bind(baseLogger)),
-		warn: createLogFunction(baseLogger.warn.bind(baseLogger)),
-		error: createLogFunction(baseLogger.error.bind(baseLogger)),
-		child: (contextId: string): ChildLogger => {
-			const childLogger = baseLogger.child({ contextId })
-
-			const createChildLogFunction = (
-				logFn: pino.LogFn,
-			): ((message: string, data?: any, contextId?: string) => void) => {
-				return (message: string, data?: any, additionalContextId?: string) => {
-					if (additionalContextId) {
-						logFn({ contextId: additionalContextId, ...data }, message)
-					} else if (data !== undefined) {
-						logFn(data, message)
-					} else {
-						logFn(message)
-					}
-				}
-			}
-
-			return {
-				debug: createChildLogFunction(childLogger.debug.bind(childLogger)),
-				info: createChildLogFunction(childLogger.info.bind(childLogger)),
-				warn: createChildLogFunction(childLogger.warn.bind(childLogger)),
-				error: createChildLogFunction(childLogger.error.bind(childLogger)),
-			}
+	return {
+		...methods(),
+		child: methods,
+		setLevel: (nextLevel) => {
+			level = nextLevel
 		},
 	}
-
-	return logger
 }
 
-// Create singleton logger instance with default level
-// This will be reconfigured in MyMCP.init() with the actual level from config
-export const logger = buildLogger('info')
+export const logger = buildLogger()
+
+export function configureLogger(level: PinoLogLevel): void {
+	logger.setLevel(level)
+}

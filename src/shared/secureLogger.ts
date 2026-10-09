@@ -1,13 +1,13 @@
-import { sanitizeError } from '@sudowealth/schwab-api'
+import { type AppLogger, redactLogData } from './log'
 
-// Keep any MCP-specific logging logic
 export function logOnlyInDevelopment(
-	logger: any,
-	level: string,
+	logger: Pick<AppLogger, 'debug' | 'info' | 'warn' | 'error'>,
+	level: 'debug' | 'info' | 'warn' | 'error',
 	message: string,
-	data?: any,
+	data?: unknown,
+	environment: string = 'production',
 ): void {
-	if (process.env.NODE_ENV !== 'production') {
-		logger[level](message, data ? sanitizeError(data) : undefined)
+	if (environment === 'development') {
+		logger[level](message, redactLogData(data))
 	}
 }

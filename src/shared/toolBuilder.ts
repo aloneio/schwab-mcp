@@ -1,20 +1,13 @@
 import { type McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
-import { type SchwabApiClient } from '@sudowealth/schwab-api'
-import { z } from 'zod'
+import { type CallToolResult } from '@modelcontextprotocol/sdk/types.js'
+import { type z } from 'zod'
+import { type ReadOnlySchwabClient } from '../tools/types'
 import { logger } from './log'
 
-// 1. Define and export the toolRegistry
-type ToolHandler<S extends z.ZodSchema> = (
+type ToolHandler<S extends z.AnyZodObject> = (
 	input: z.infer<S>,
-	client: SchwabApiClient,
+	client: ReadOnlySchwabClient,
 ) => Promise<ToolResponse>
-
-interface RegisteredTool<S extends z.ZodSchema> {
-	schema: S
-	handler: ToolHandler<S>
-}
-
-const toolRegistry = new Map<string, RegisteredTool<any>>()
 
 type ToolResponse<T = unknown> =
 	| { ok: true; data: T; message?: string }
@@ -26,12 +19,7 @@ function isOk<T>(
 	return res.ok
 }
 
-type McpContentArray = {
-	content: Array<{ type: string; text: string }>
-	isError?: boolean
-}
-
-function formatResponse(response: ToolResponse): McpContentArray {
+function formatResponse(response: ToolResponse): CallToolResult {
 	// Handle ToolResponse format
 	if ('ok' in response) {
 		if (isOk(response)) {
@@ -41,7 +29,7 @@ function formatResponse(response: ToolResponse): McpContentArray {
 				(dataToLog && (dataToLog as any).message) ||
 				'Operation successful'
 
-			const content: Array<{ type: string; text: string }> = [
+			const content: Array<{ type: 'text'; text: string }> = [
 				{ type: 'text', text: message },
 			]
 
@@ -59,7 +47,9 @@ function formatResponse(response: ToolResponse): McpContentArray {
 						? response.error.message
 						: String(response.error)
 			}
-			const content = [{ type: 'text', text: errorMessage }]
+			const content: Array<{ type: 'text'; text: string }> = [
+				{ type: 'text', text: errorMessage },
+			]
 			if ('details' in response && response.details) {
 				if (response.details.formattedDetails) {
 					content.push({
@@ -151,8 +141,8 @@ export function toolSuccess<T>({
 	return { ok: true, data, message }
 }
 
-export function createTool<S extends z.ZodSchema<any, any>>(
-	client: SchwabApiClient,
+export function createTool<S extends z.AnyZodObject>(
+	client: ReadOnlySchwabClient,
 	server: McpServer,
 	{
 		name,
@@ -166,44 +156,23 @@ export function createTool<S extends z.ZodSchema<any, any>>(
 		handler: ToolHandler<S>
 	},
 ) {
-	// Populate the internal toolRegistry
-	toolRegistry.set(name, { schema, handler })
-	logger.info(`[ToolBuilder] Added tool '${name}' to internal toolRegistry.`)
-
-	// Keep individual tool registration with McpServer for potential direct calls
-	// or if the dispatcher logic is ever removed.
-	logger.info(
-		`[ToolBuilder] Registering tool with McpServer for direct call: '${name}'.`,
-	)
-	server.tool(
+	server.registerTool(
 		name,
-		description,
-		schema instanceof z.ZodObject ? schema.shape : {},
-		async (args: any) => {
+		{
+			description,
+			inputSchema: schema.shape,
+			annotations: {
+				readOnlyHint: true,
+				destructiveHint: false,
+				idempotentHint: true,
+			},
+		},
+		async (args: z.infer<S>) => {
 			try {
 				logger.info(`[ToolBuilder] Direct invocation of tool: ${name}`)
-				let parsedInput: z.infer<S>
-				try {
-					parsedInput = schema.parse(args)
-				} catch (validationError) {
-					logger.error(`Input validation error in direct tool: ${name}`, {
-						validationError:
-							validationError instanceof Error
-								? validationError.message
-								: String(validationError),
-						argsReceived: args,
-					})
-					return formatResponse(
-						toolError('Invalid input for direct tool call.', {
-							details:
-								validationError instanceof Error
-									? validationError.message
-									: String(validationError),
-						}),
-					)
-				}
-				const result = await handler(parsedInput, client)
-				return formatResponse(result) as any
+				// McpServer has already validated and transformed the input once.
+				const result = await handler(args as z.infer<S>, client)
+				return formatResponse(result)
 			} catch (error) {
 				logger.error(`Unexpected error in direct tool: ${name}`, {
 					error: error instanceof Error ? error.message : String(error),
@@ -219,8 +188,4 @@ export function createTool<S extends z.ZodSchema<any, any>>(
 			}
 		},
 	)
-	// The log from `createTool` in the original plan was inside the `createTool` that takes `name, schema, handler`
-	// The message "Registered tool with McpServer: '${name}' using schema definition." is a bit redundant now
-	// as we have a more specific log above for direct call registration.
-	// Let's stick to the specific logs for clarity.
 }

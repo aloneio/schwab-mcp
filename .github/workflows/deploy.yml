@@ -20,18 +20,24 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
+          cache: 'npm'
 
       - name: 📥 Download deps
-        uses: bahmutov/npm-install@v1
-        with:
-          useLockFile: false
+        run: npm ci
 
       - name: 🔍 Validate
         run: npm run validate
 
+      - name: Test
+        run: npm test
+
+      - name: Test Worker integration
+        run: npm run test:integration
+
   release:
     name: 🚀 Release
     needs: [validate]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -48,13 +54,20 @@ jobs:
       - name: Validate
         run: npm run validate
 
+      - name: Test
+        run: npm test
+
       - name: Create deployment config
-        if: github.ref == 'refs/heads/main'
+        env:
+          WORKER_NAME: ${{ vars.CLOUDFLARE_WORKER_NAME || 'schwab-mcp' }}
+          OAUTH_KV_ID: ${{ secrets.OAUTH_KV_ID }}
         run: |
-          cat > wrangler.deploy.jsonc << 'EOF'
-          {
+          node --input-type=module << 'EOF'
+          import { writeFileSync } from 'node:fs';
+          if (!process.env.OAUTH_KV_ID) throw new Error('OAUTH_KV_ID is required');
+          const config = {
             "$schema": "node_modules/wrangler/config-schema.json",
-            "name": "schwab-mcp",
+            "name": process.env.WORKER_NAME,
             "main": "src/index.ts",
             "compatibility_date": "2025-04-17",
             "compatibility_flags": ["nodejs_compat"],
@@ -62,6 +75,10 @@ jobs:
               {
                 "new_sqlite_classes": ["MyMCP"],
                 "tag": "v1"
+              },
+              {
+                "new_sqlite_classes": ["SchwabAuthCoordinator"],
+                "tag": "v2"
               }
             ],
             "durable_objects": {
@@ -69,13 +86,17 @@ jobs:
                 {
                   "class_name": "MyMCP",
                   "name": "MCP_OBJECT"
+                },
+                {
+                  "class_name": "SchwabAuthCoordinator",
+                  "name": "SCHWAB_AUTH"
                 }
               ]
             },
             "kv_namespaces": [
               {
                 "binding": "OAUTH_KV",
-                "id": "${{ secrets.OAUTH_KV_ID }}"
+                "id": process.env.OAUTH_KV_ID
               }
             ],
             "observability": {
@@ -86,11 +107,11 @@ jobs:
               "local_protocol": "https",
               "upstream_protocol": "https"
             }
-          }
+          };
+          writeFileSync('wrangler.deploy.jsonc', JSON.stringify(config, null, 2));
           EOF
 
       - name: Deploy to Cloudflare Workers
-        if: github.ref == 'refs/heads/main'
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}

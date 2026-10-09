@@ -6,4 +6,8 @@ export default [
 	{
 		ignores: ['./.wrangler/**'],
 	},
+	{
+		files: ['tests/**/*.ts'],
+		rules: { 'vitest/no-import-node-test': 'off' },
+	},
 ]

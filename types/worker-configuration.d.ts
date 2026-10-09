@@ -11,6 +11,9 @@ declare namespace Cloudflare {
 		SCHWAB_REDIRECT_URI: string
 		HOSTED_DOMAIN: string
 		MCP_OBJECT: DurableObjectNamespace<import('../src/index').MyMCP>
+		SCHWAB_AUTH: DurableObjectNamespace<
+			import('../src/auth/coordinator').SchwabAuthCoordinator
+		>
 	}
 }
 interface Env extends Cloudflare.Env {}

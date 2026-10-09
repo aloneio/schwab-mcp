@@ -1,9 +1,6 @@
 import {
 	GetInstrumentByCusipParams,
 	GetInstrumentsParams,
-	GetMarketHoursByMarketIdParams,
-	GetMarketHoursParams,
-	GetMoversParams,
 	GetOptionChainParams,
 	GetOptionExpirationChainParams,
 	GetPriceHistoryParams,
@@ -12,6 +9,11 @@ import {
 } from '@sudowealth/schwab-api'
 import { logger } from '../../shared/log'
 import { createToolSpec } from '../types'
+import {
+	MarketHoursParams,
+	MarketHoursByMarketIdParams,
+	MoversParams,
+} from './schemas'
 
 export const toolSpecs = [
 	createToolSpec({
@@ -71,19 +73,19 @@ export const toolSpecs = [
 	createToolSpec({
 		name: 'getMarketHours',
 		description: 'Get market hours for different markets',
-		schema: GetMarketHoursParams,
+		schema: MarketHoursParams,
 		call: (c, p) =>
 			c.marketData.marketHours.getMarketHours({
 				queryParams: {
 					markets: p.markets,
-					date: p.date ? new Date(p.date).toISOString() : undefined,
+					date: p.date,
 				},
 			}),
 	}),
 	createToolSpec({
 		name: 'getMarketHoursByMarketId',
 		description: 'Get market hours for a specific market',
-		schema: GetMarketHoursByMarketIdParams,
+		schema: MarketHoursByMarketIdParams,
 		call: (c, p) =>
 			c.marketData.marketHours.getMarketHoursByMarketId({
 				pathParams: { market_id: p.market_id },
@@ -93,7 +95,7 @@ export const toolSpecs = [
 	createToolSpec({
 		name: 'getMovers',
 		description: 'Get movers for a specific index',
-		schema: GetMoversParams,
+		schema: MoversParams,
 		call: (c, p) =>
 			c.marketData.movers.getMovers({
 				pathParams: { symbol_id: p.symbol_id },
@@ -106,7 +108,7 @@ export const toolSpecs = [
 		schema: GetOptionChainParams,
 		call: (c, p) =>
 			c.marketData.options.getOptionChain({
-				queryParams: { symbol: p.symbol },
+				queryParams: p,
 			}),
 	}),
 	createToolSpec({
@@ -124,15 +126,7 @@ export const toolSpecs = [
 		schema: GetPriceHistoryParams,
 		call: (c, p) =>
 			c.marketData.priceHistory.getPriceHistory({
-				queryParams: {
-					symbol: p.symbol,
-					period: p.period,
-					periodType: p.periodType,
-					frequency: p.frequency,
-					frequencyType: p.frequencyType,
-					startDate: p.startDate,
-					endDate: p.endDate,
-				},
+				queryParams: p,
 			}),
 	}),
 ] as const

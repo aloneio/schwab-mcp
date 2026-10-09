@@ -1,187 +1,49 @@
-import { type ClientInfo } from '@cloudflare/workers-oauth-provider'
-import { type ValidatedEnv } from '../../../types/env'
-import { APPROVAL_CONFIG } from './config'
+import { randomToken } from '../service'
 
-/**
- * Configuration for the approval dialog
- */
-interface ApprovalDialogOptions {
-	/**
-	 * Client information for basic display
-	 */
-	client: ClientInfo | null
-	/**
-	 * Server information
-	 */
-	server: {
-		name: string
-		logo?: string
-	}
-	/**
-	 * State data to encode in the approval flow
-	 */
-	state: Record<string, any>
-	/**
-	 * Validated environment configuration
-	 */
-	config: ValidatedEnv
+export function escapeHtml(value: string): string {
+	return value.replace(
+		/[&<>"']/g,
+		(char) =>
+			({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[
+				char
+			]!,
+	)
 }
 
-/**
- * Renders an approval page that redirects to Schwab OAuth
- * Following Cloudflare's pattern of minimal custom UI
- *
- * @param request - The HTTP request
- * @param options - Configuration for the approval
- * @returns A Response containing HTML with auto-redirect
- */
-export function renderApprovalDialog(
-	request: Request,
-	options: ApprovalDialogOptions,
-): Response {
-	const { client, server, state } = options
-
-	// Encode state for the redirect
-	const encodedState = btoa(JSON.stringify(state))
-
-	const htmlContent = `
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-      <meta charset="UTF-8">
-      <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>Authorizing ${client?.clientName || 'MCP Client'}</title>
-      <style>
-        body {
-          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-          margin: 0;
-          padding: 0;
-          background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-          min-height: 100vh;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-        }
-        .container {
-          background: white;
-          border-radius: 12px;
-          padding: 2rem;
-          box-shadow: 0 10px 40px rgba(0,0,0,0.1);
-          text-align: center;
-          max-width: 400px;
-          width: 90%;
-        }
-        .logo {
-          width: 64px;
-          height: 64px;
-          margin: 0 auto 1rem;
-          border-radius: 12px;
-        }
-        h1 {
-          margin: 0 0 1rem 0;
-          color: #333;
-          font-size: 1.5rem;
-          font-weight: 600;
-        }
-        p {
-          color: #666;
-          margin: 0 0 2rem 0;
-          line-height: 1.5;
-        }
-        .btn {
-          background: #0070f3;
-          color: white;
-          border: none;
-          padding: 1rem 2rem;
-          border-radius: 8px;
-          font-size: 1rem;
-          font-weight: 500;
-          cursor: pointer;
-          width: 100%;
-          transition: background 0.2s;
-        }
-        .btn:hover {
-          background: #0051cc;
-        }
-        .spinner {
-          display: none;
-          width: 20px;
-          height: 20px;
-          border: 2px solid #ffffff40;
-          border-top: 2px solid #ffffff;
-          border-radius: 50%;
-          animation: spin 1s linear infinite;
-          margin: 0 auto;
-        }
-        @keyframes spin {
-          0% { transform: rotate(0deg); }
-          100% { transform: rotate(360deg); }
-        }
-        .auto-redirect {
-          color: #888;
-          font-size: 0.9rem;
-          margin-top: 1rem;
-        }
-      </style>
-    </head>
-    <body>
-      <div class="container">
-        ${server.logo ? `<img src="${server.logo}" alt="${server.name}" class="logo">` : ''}
-        <h1>Connect to ${server.name}</h1>
-        <p><strong>${client?.clientName || 'An MCP Client'}</strong> wants to access your Schwab account through ${server.name}.</p>
-        
-        <form method="post" action="${new URL(request.url).pathname}" id="approvalForm">
-          <input type="hidden" name="state" value="${encodedState}">
-          <button type="submit" class="btn" id="approveBtn">
-            <span id="btnText">Continue to Schwab</span>
-            <div class="spinner" id="spinner"></div>
-          </button>
-        </form>
-        
-        <p class="auto-redirect">Redirecting automatically in <span id="countdown">3</span> seconds...</p>
-      </div>
-
-      <script>
-        // Auto-submit after countdown
-        let countdown = ${APPROVAL_CONFIG.COUNTDOWN_SECONDS};
-        const countdownEl = document.getElementById('countdown');
-        const form = document.getElementById('approvalForm');
-        const btn = document.getElementById('approveBtn');
-        const btnText = document.getElementById('btnText');
-        const spinner = document.getElementById('spinner');
-        
-        const timer = setInterval(() => {
-          countdown--;
-          countdownEl.textContent = countdown;
-          if (countdown <= 0) {
-            clearInterval(timer);
-            submitForm();
-          }
-        }, 1000);
-        
-        // Handle manual click
-        form.addEventListener('submit', (e) => {
-          e.preventDefault();
-          clearInterval(timer);
-          submitForm();
-        });
-        
-        function submitForm() {
-          btnText.style.display = 'none';
-          spinner.style.display = 'block';
-          btn.disabled = true;
-          form.submit();
-        }
-      </script>
-    </body>
-    </html>
-  `
-
-	return new Response(htmlContent, {
+export function renderApprovalDialog(options: {
+	clientName: string
+	redirectUri: string
+	transactionId: string
+	cookie: string
+}): Response {
+	const nonce = randomToken()
+	const html = `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Connect to Schwab</title>
+<style nonce="${nonce}">
+body{font-family:system-ui,sans-serif;background:#eef3f8;color:#172b42;margin:0;min-height:100vh;display:grid;place-items:center}
+main{background:white;max-width:32rem;margin:1.5rem;padding:2rem;border-radius:1rem;box-shadow:0 8px 40px #172b4212}
+h1{font-size:1.7rem}p{line-height:1.6}small{overflow-wrap:anywhere;color:#4e6175}form{display:flex;gap:.75rem;margin-top:1.5rem}
+button{padding:.8rem 1rem;border:1px solid #a6b8cb;border-radius:.4rem;font:inherit;cursor:pointer}button[value=approve]{background:#075da8;color:white;border-color:#075da8}
+</style></head><body><main>
+<h1>Connect to Schwab</h1>
+<p><strong>${escapeHtml(options.clientName)}</strong> requests read-only access to your Schwab account through this MCP server.</p>
+<p>The connection can read account information and market data. It cannot place, replace, or cancel orders, or change account settings.</p>
+<p><small>Client callback: ${escapeHtml(options.redirectUri)}</small></p>
+<p>Approve to continue to Schwab sign-in. You can cancel this request.</p>
+<form method="post" action="/authorize">
+<input type="hidden" name="transaction" value="${escapeHtml(options.transactionId)}">
+<button type="submit" name="decision" value="approve">Approve and continue</button>
+<button type="submit" name="decision" value="deny">Cancel</button>
+</form></main></body></html>`
+	return new Response(html, {
 		headers: {
 			'Content-Type': 'text/html; charset=utf-8',
-			'Content-Security-Policy':
-				"default-src 'self' 'unsafe-inline'; img-src https: data:;",
+			'Set-Cookie': options.cookie,
+			'Cache-Control': 'no-store',
+			'Referrer-Policy': 'no-referrer',
+			'X-Content-Type-Options': 'nosniff',
+			'Content-Security-Policy': `default-src 'none'; style-src 'nonce-${nonce}'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'`,
 		},
 	})
 }
